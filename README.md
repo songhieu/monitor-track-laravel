@@ -11,6 +11,8 @@ and queue worker heartbeats. The wire format is described in
 
 Requires PHP 8.1+ and Laravel 10, 11, 12 or 13 (Monolog 3). Every
 combination is tested in CI, including the lowest supported versions.
+Laravel 10 and 11 no longer receive security fixes; Composer 2.10+ refuses
+to install them while they have open advisories — upgrading is the real fix.
 
 ## Install
 

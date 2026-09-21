@@ -15,10 +15,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { php: '8.1', laravel: '10', testbench: '8', phpunit: '10.5' }
-          - { php: '8.1', laravel: '10', testbench: '8', phpunit: '10.5', lowest: true }
-          - { php: '8.2', laravel: '11', testbench: '9', phpunit: '11' }
-          - { php: '8.3', laravel: '11', testbench: '9', phpunit: '11' }
+          # eol: Laravel 10/11 no longer get security fixes, so every release
+          # has an open advisory and Composer 2.10+ refuses to install them.
+          # Apps still on them need the SDK tested there anyway.
+          - { php: '8.1', laravel: '10', testbench: '8', phpunit: '10.5', eol: true }
+          - { php: '8.1', laravel: '10', testbench: '8', phpunit: '10.5', eol: true, lowest: true }
+          - { php: '8.2', laravel: '11', testbench: '9', phpunit: '11', eol: true }
+          - { php: '8.3', laravel: '11', testbench: '9', phpunit: '11', eol: true }
           - { php: '8.3', laravel: '12', testbench: '10', phpunit: '11' }
           - { php: '8.4', laravel: '12', testbench: '10', phpunit: '11' }
           - { php: '8.3', laravel: '13', testbench: '11', phpunit: '12' }
@@ -35,6 +38,10 @@ jobs:
 
       - name: Validate composer.json
         run: composer validate --strict --no-check-lock
+
+      - name: Allow end-of-life Laravel with open advisories (test only)
+        if: matrix.eol
+        run: composer config policy.advisories.block false
 
       - name: Install Laravel ${{ matrix.laravel }}
         run: |
