@@ -4,13 +4,23 @@ namespace MonitorTrack\Console;
 
 use Illuminate\Console\Command;
 use MonitorTrack\Client;
+use MonitorTrack\Transport\StreamTransport;
 
 /**
  * `php artisan mt:test` — emits one event of each type and shows where they went.
  */
 class TestCommand extends Command
 {
-    protected $signature = 'mt:test';
+    protected $signature = 'mt:test
+        {--pod-log : Write to the container\'s own stderr, so the collector sees events sent through kubectl exec}';
+
+    /**
+     * The container's main process stderr, i.e. the pod log (overridable in tests).
+     */
+    public static string $podLog = '/proc/1/fd/2';
+
+    /** @var resource|null */
+    private $pipe = null;
 
     protected $description = 'Send one monitor-track event of each type (log, exception, job, cron, heartbeat)';
 
@@ -20,6 +30,22 @@ class TestCommand extends Command
             $this->warn('monitor-track is disabled (MT_ENABLED=false): nothing sent.');
 
             return self::SUCCESS;
+        }
+
+        $podLog = (bool) $this->option('pod-log');
+        if ($podLog) {
+            if (! $client->transport() instanceof StreamTransport) {
+                $this->warn('--pod-log only applies to MT_TRANSPORT=stream; sending through '.$client->transport()->describe().'.');
+                $podLog = false;
+            } else {
+                $h = $this->openPodLog();
+                if ($h === false) {
+                    $this->error('Cannot write to '.self::$podLog.' (the container\'s stderr). Run as the same user as the main process, or pipe: php artisan mt:test 2>'.self::$podLog);
+
+                    return self::FAILURE;
+                }
+                $client->streamTo($h);
+            }
         }
 
         $client->log('info', 'monitor-track test log from mt:test', ['source' => 'mt:test', 'password' => 'masked-by-sdk']);
@@ -50,9 +76,19 @@ class TestCommand extends Command
 
         $pending = $client->transport()->pending();
         $client->flush(3.0);
+        if ($podLog && $this->pipe !== null) {
+            @pclose($this->pipe); // waits for the shell to write everything
+        }
 
         $this->info('monitor-track test events sent.');
-        $this->line('  transport:   '.$client->transport()->describe());
+        $this->line('  transport:   '.($podLog ? 'stream '.self::$podLog.' (pod log)' : $client->transport()->describe()));
+        if (! $podLog && $client->transport() instanceof StreamTransport
+            && getenv('KUBERNETES_SERVICE_HOST') !== false && getmypid() !== 1) {
+            // kubectl exec gives the command its own stderr, which is not the
+            // container log the collector reads.
+            $this->line('  note:        inside a pod? Through kubectl exec these lines went to this command\'s');
+            $this->line('               output, not the pod log. Re-run with --pod-log so the collector sees them.');
+        }
         if ($pending > 0) {
             $this->line("  flushed:     {$pending} buffered event(s)");
         }
@@ -67,5 +103,35 @@ class TestCommand extends Command
         }
 
         return self::SUCCESS;
+    }
+
+    /**
+     * @return resource|false
+     */
+    private function openPodLog()
+    {
+        $path = self::$podLog;
+        $h = @fopen($path, 'ab');
+        if ($h !== false) {
+            return $h;
+        }
+
+        // PHP resolves /proc/1/fd/2 to "pipe:[…]", which is not a path, so
+        // let the shell open it. Check first that it can: writing into a
+        // pipe whose reader died would kill this command.
+        if (! function_exists('popen') || ! function_exists('exec')) {
+            return false;
+        }
+        $target = escapeshellarg($path);
+        @exec('sh -c '.escapeshellarg(': >> '.$target).' 2>/dev/null', $out, $code);
+        if ($code !== 0) {
+            return false;
+        }
+        $pipe = @popen('cat >> '.$target, 'w');
+        if ($pipe === false) {
+            return false;
+        }
+
+        return $this->pipe = $pipe;
     }
 }

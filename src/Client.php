@@ -178,6 +178,17 @@ class Client
     }
 
     /**
+     * Send events as JSON lines to another stream, keeping the counters
+     * (`mt:test --pod-log` writes to the container's own stderr).
+     *
+     * @param  string|resource  $target
+     */
+    public function streamTo($target): void
+    {
+        $this->transport = new StreamTransport($target, $this->stats);
+    }
+
+    /**
      * Swap the transport for an in-memory one and enable the client
      * (application tests: MonitorTrack::fake()->events('job')).
      */

@@ -22,6 +22,17 @@ composer require songhieu/monitor-track-laravel
 php artisan mt:test          # emits one event of each type and shows where they went
 ```
 
+On Kubernetes, run the test inside a pod with `--pod-log`:
+
+```bash
+kubectl -n billing exec deploy/billing-api -- php artisan mt:test --pod-log
+```
+
+`kubectl exec` gives the command its own stderr, which is not the container
+log the collector reads; `--pod-log` writes to the container's stderr
+(`/proc/1/fd/2`) instead. It must run as the same user as the container's
+main process, which is what `kubectl exec` does by default.
+
 Package discovery registers the service provider and the `MonitorTrack`
 facade. The default transport writes one JSON line per event to stderr. The
 monitor-track collector already reads pod logs, so on Kubernetes you usually
