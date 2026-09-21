@@ -41,11 +41,22 @@ return [
     // Minimum level for the "monitor-track" logging channel.
     'log_level' => env('MT_LOG_LEVEL', 'debug'),
 
+    // Database queries (type=query events). A query at least this slow (ms)
+    // is reported; so is a statement run this many times in one request,
+    // job, command or scheduled task (N+1). 0 turns either check off.
+    'slow_query_ms' => env('MT_SLOW_QUERY_MS', 500),
+    'n_plus_one' => env('MT_N_PLUS_ONE', 10),
+
+    // At most one query event per statement and call site per this many
+    // seconds on one server (a marker file in the temp dir). 0 = every one.
+    'query_throttle_seconds' => env('MT_QUERY_THROTTLE_SECONDS', 60),
+
     // Automatic integrations.
     'capture' => [
         'exceptions' => true,   // ExceptionHandler::reportable()
         'queue' => true,        // job runs + worker heartbeats
         'schedule' => true,     // scheduled task runs
+        'queries' => true,      // slow queries + N+1
     ],
 
     // http transport timeouts (per request; one quick retry on connection errors).

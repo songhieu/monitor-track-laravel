@@ -24,6 +24,8 @@ abstract class TestCase extends Orchestra
         $app['config']->set('app.name', 'billing-api');
         $app['config']->set('app.timezone', 'Asia/Ho_Chi_Minh');
         $app['config']->set('monitor-track.release', '2026.09.21-2');
+        // The query throttle's marker files outlive a test run.
+        $app['config']->set('monitor-track.query_throttle_seconds', 0);
     }
 
     protected function client(): Client

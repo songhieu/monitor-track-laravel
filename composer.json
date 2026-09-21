@@ -1,14 +1,16 @@
 {
     "name": "songhieu/monitor-track-laravel",
-    "description": "Laravel SDK for monitor-track App Logs: exceptions with stack frames, queue job runs, scheduled task runs and worker heartbeats. Fail-open, never slows the app.",
+    "description": "Laravel SDK for monitor-track App Logs: exceptions with stack frames, queue job runs, scheduled task runs, worker heartbeats, and slow and N+1 queries. Fail-open, never slows the app.",
     "type": "library",
     "license": "MIT",
     "keywords": [
         "laravel",
         "logging",
         "monitoring",
+        "n-plus-one",
         "queue",
         "scheduler",
+        "slow-query",
         "monitor-track"
     ],
     "require": {

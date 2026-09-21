@@ -5,6 +5,7 @@ namespace MonitorTrack;
 use Illuminate\Contracts\Debug\ExceptionHandler;
 use Illuminate\Support\ServiceProvider;
 use MonitorTrack\Console\TestCommand;
+use MonitorTrack\Listeners\QueryListener;
 use MonitorTrack\Listeners\QueueListener;
 use MonitorTrack\Listeners\ScheduleListener;
 use MonitorTrack\Monolog\ChannelFactory;
@@ -91,6 +92,15 @@ class MonitorTrackServiceProvider extends ServiceProvider
             if ($capture['schedule'] ?? true) {
                 $tz = $this->app['config']->get('app.timezone');
                 (new ScheduleListener($client, is_string($tz) ? $tz : null))->subscribe($events);
+            }
+
+            if (($capture['queries'] ?? true) && ($client->slowQueryMs() > 0 || $client->nPlusOne() > 0)) {
+                $queries = new QueryListener($client, $this->app);
+                $queries->subscribe($events);
+                $this->app->instance(QueryListener::class, $queries);
+                // Registered before the flush below, so a request's findings
+                // leave in the same http batch.
+                $this->app->terminating(static fn () => $queries->terminate());
             }
         } catch (\Throwable) {
         }

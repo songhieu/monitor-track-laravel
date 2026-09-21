@@ -74,6 +74,11 @@ final class EnvelopeEncoder
             }
         }
 
+        if (isset($e['query']['frames']) && is_array($e['query']['frames'])
+            && count($e['query']['frames']) > $frames) {
+            $e['query']['frames'] = array_slice($e['query']['frames'], 0, $frames);
+        }
+
         if (isset($e['cron']['output']) && is_string($e['cron']['output'])) {
             $e['cron']['output'] = self::tail($e['cron']['output'], $output);
         }

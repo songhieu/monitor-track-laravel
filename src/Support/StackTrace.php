@@ -3,8 +3,8 @@
 namespace MonitorTrack\Support;
 
 /**
- * Converts a Throwable into wire frames: innermost first, paths relative to
- * the app base path, in_app = not vendor/.
+ * Converts a Throwable or a backtrace into wire frames: innermost first,
+ * paths relative to the app base path, in_app = not vendor/.
  */
 final class StackTrace
 {
@@ -17,22 +17,81 @@ final class StackTrace
      */
     public static function frames(\Throwable $e, string $basePath, int $max = self::MAX_FRAMES): array
     {
-        $basePath = rtrim($basePath, '/\\');
-        $trace = $e->getTrace();
+        $frames = self::withoutSdk(self::raw($e->getFile(), $e->getLine(), $e->getTrace()));
 
-        // PHP's trace entry i holds the call site of function i. The function
-        // executing at a file:line is therefore the one from entry i-1's
-        // point of view: shift by one so each frame pairs file:line with the
-        // function that was running there.
+        $out = [];
+        foreach (array_slice($frames, 0, $max) as $f) {
+            $out[] = self::frame($f['file'], $f['line'], $f['func'], $basePath);
+        }
+
+        return $out;
+    }
+
+    /**
+     * Frames of a debug_backtrace() taken inside the SDK (the call site of a
+     * database query): the SDK's frames are removed and the framework and
+     * vendor frames above the first application frame are dropped, so
+     * frames[0] is the application code that made the call. Without any
+     * application frame, the frames from the caller of $after (for example
+     * the database connection's logQuery) onwards are kept.
+     *
+     * @param  list<array<string, mixed>>  $trace  debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS)
+     * @param  string  $after  func of the innermost frame to skip in that fallback
+     * @return list<array{file:string, line:int, func:string, in_app:bool}>
+     */
+    public static function fromBacktrace(array $trace, string $basePath, int $max = self::MAX_FRAMES, string $after = ''): array
+    {
+        // The first raw frame would be the line inside the SDK that called
+        // debug_backtrace(), which is not in the trace itself.
+        $raw = self::raw('', 0, $trace);
+        array_shift($raw);
+
+        $frames = [];
+        $start = null;
+        foreach (self::withoutSdk($raw) as $f) {
+            $frame = self::frame($f['file'], $f['line'], $f['func'], $basePath);
+            if ($start === null && $frame['in_app']) {
+                $start = count($frames);
+            }
+            $frames[] = $frame;
+            if ($start !== null && count($frames) - $start >= $max) {
+                break;
+            }
+        }
+
+        if ($start === null) {
+            $start = 0;
+            foreach ($frames as $i => $f) {
+                if ($after !== '' && $f['func'] === $after) {
+                    $start = $i + 1;
+                    break;
+                }
+            }
+        }
+
+        return array_slice($frames, $start, $max);
+    }
+
+    /**
+     * PHP's trace entry i holds the call site of function i. The function
+     * executing at a file:line is therefore the one from entry i-1's point of
+     * view: shift by one so each frame pairs file:line with the function that
+     * was running there.
+     *
+     * @param  list<array<string, mixed>>  $trace
+     * @return list<array{file:string, line:int, func:string, sdk:bool}>
+     */
+    private static function raw(string $file, int $line, array $trace): array
+    {
         $raw = [[
-            'file' => $e->getFile(),
-            'line' => $e->getLine(),
+            'file' => $file,
+            'line' => $line,
             'func' => isset($trace[0]) ? self::func($trace[0]) : '{main}',
         ]];
 
         foreach ($trace as $i => $entry) {
             $raw[] = [
-                'file' => $entry['file'] ?? '',
+                'file' => (string) ($entry['file'] ?? ''),
                 'line' => (int) ($entry['line'] ?? 0),
                 'func' => isset($trace[$i + 1]) ? self::func($trace[$i + 1]) : '{main}',
             ];
@@ -41,27 +100,25 @@ final class StackTrace
         $frames = [];
         $sdkDir = dirname(__DIR__);
         foreach ($raw as $f) {
-            $frames[] = [
-                'file' => $f['file'],
-                'line' => $f['line'],
-                'func' => $f['func'],
-                'sdk' => $f['file'] !== '' && str_starts_with($f['file'], $sdkDir.DIRECTORY_SEPARATOR),
-            ];
+            $f['sdk'] = $f['file'] !== '' && str_starts_with($f['file'], $sdkDir.DIRECTORY_SEPARATOR);
+            $frames[] = $f;
         }
 
-        // Drop the SDK's own frames, unless that would leave nothing (an
-        // exception created inside the SDK, e.g. by `artisan mt:test`).
+        return $frames;
+    }
+
+    /**
+     * Drops the SDK's own frames, unless that would leave nothing (an
+     * exception created inside the SDK, e.g. by `artisan mt:test`).
+     *
+     * @param  list<array{file:string, line:int, func:string, sdk:bool}>  $frames
+     * @return list<array{file:string, line:int, func:string, sdk:bool}>
+     */
+    private static function withoutSdk(array $frames): array
+    {
         $withoutSdk = array_values(array_filter($frames, static fn ($f) => ! $f['sdk']));
-        if ($withoutSdk !== []) {
-            $frames = $withoutSdk;
-        }
 
-        $out = [];
-        foreach (array_slice($frames, 0, $max) as $f) {
-            $out[] = self::frame($f['file'], $f['line'], $f['func'], $basePath);
-        }
-
-        return $out;
+        return $withoutSdk !== [] ? $withoutSdk : $frames;
     }
 
     /**
@@ -74,7 +131,7 @@ final class StackTrace
         }
 
         $normalized = str_replace('\\', '/', $file);
-        $base = str_replace('\\', '/', $basePath);
+        $base = rtrim(str_replace('\\', '/', $basePath), '/');
         $relative = null;
         if ($base !== '' && str_starts_with($normalized, $base.'/')) {
             $relative = substr($normalized, strlen($base) + 1);

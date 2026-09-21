@@ -212,6 +212,53 @@ class EnvelopeTest extends TestCase
         $this->assertSame(['emitted' => 4, 'dropped' => 0, 'sampled' => 1, 'errors' => 0], $client->stats());
     }
 
+    public function test_query_payload_and_messages(): void
+    {
+        [$client, $memory] = $this->client();
+        $frames = [['file' => 'app/Http/Controllers/OrderController.php', 'line' => 42, 'func' => 'App\\Http\\Controllers\\OrderController->index', 'in_app' => true]];
+        $sql = 'select * from `users` where `users`.`id` = ? limit ?';
+
+        $client->query('n_plus_one', [
+            'sql' => $sql, 'connection' => 'mysql', 'count' => 37, 'total_ms' => 412.5, 'max_ms' => 31.2,
+            'threshold' => 10, 'scope' => 'request', 'scope_name' => 'GET /orders/{order}', 'frames' => $frames,
+        ]);
+        $client->query('slow', [
+            'sql' => 'select '.str_repeat('x, ', 1000).'y from t', 'count' => 1, 'total_ms' => 812.0, 'max_ms' => 812.4,
+            'threshold' => 500, 'scope' => 'job', 'scope_name' => 'App\\Jobs\\SyncStock',
+        ]);
+
+        [$repeated, $slow] = $memory->events('query');
+        $this->assertSame('warning', $repeated['level']);
+        $this->assertSame("N+1 query: 37× {$sql}", $repeated['message']);
+        $this->assertSame([
+            'kind' => 'n_plus_one', 'sql' => $sql, 'connection' => 'mysql', 'count' => 37, 'total_ms' => 412.5,
+            'max_ms' => 31.2, 'threshold' => 10, 'scope' => 'request', 'scope_name' => 'GET /orders/{order}', 'frames' => $frames,
+        ], $repeated['query']);
+        $this->assertStringContainsString('"total_ms":412.5,"max_ms":31.2', $memory->lines()[0]);
+
+        $this->assertMatchesRegularExpression('/^Slow query \(812ms\): select x, x, .{80,}…$/', $slow['message']);
+        $this->assertLessThanOrEqual(120, strlen(substr($slow['message'], strlen('Slow query (812ms): '))));
+        $this->assertLessThanOrEqual(2000, strlen($slow['query']['sql']));
+        $this->assertSame(812.0, $slow['query']['total_ms']);
+        $this->assertArrayNotHasKey('connection', $slow['query']);
+        $this->assertArrayNotHasKey('frames', $slow['query']);
+    }
+
+    public function test_query_thresholds_from_env_values(): void
+    {
+        $defaults = Client::normalizeOptions([]);
+        $this->assertSame([500.0, 10, 60], [$defaults['slow_query_ms'], $defaults['n_plus_one'], $defaults['query_throttle_seconds']]);
+
+        $o = Client::normalizeOptions(['slow_query_ms' => '250.5', 'n_plus_one' => '1', 'query_throttle_seconds' => '0']);
+        $this->assertSame([250.5, 2, 0], [$o['slow_query_ms'], $o['n_plus_one'], $o['query_throttle_seconds']]);
+
+        $o = Client::normalizeOptions(['slow_query_ms' => false, 'n_plus_one' => 'off', 'query_throttle_seconds' => '']);
+        $this->assertSame([0.0, 0, 60], [$o['slow_query_ms'], $o['n_plus_one'], $o['query_throttle_seconds']]);
+
+        $o = Client::normalizeOptions(['slow_query_ms' => 'garbage', 'n_plus_one' => -5]);
+        $this->assertSame([500.0, 0], [$o['slow_query_ms'], $o['n_plus_one']]);
+    }
+
     public function test_disabled_client_is_a_no_op(): void
     {
         $memory = new MemoryTransport;
@@ -222,6 +269,7 @@ class EnvelopeTest extends TestCase
         $client->job('start', ['class' => 'J']);
         $client->cron('start', ['name' => 'c']);
         $client->heartbeat([]);
+        $client->query('slow', ['sql' => 'select 1']);
         $client->flush();
 
         $this->assertFalse($client->isEnabled());

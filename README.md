@@ -6,7 +6,8 @@
 `songhieu/monitor-track-laravel` sends structured events to monitor-track
 App Logs. Plain log lines can't carry this data: exceptions with real stack
 frames, exact queue job runs, scheduled task runs that register themselves,
-and queue worker heartbeats. The wire format is described in
+queue worker heartbeats, and slow or N+1 database queries with the line of
+your code that ran them. The wire format is described in
 [`docs/sdk-spec.md`](docs/sdk-spec.md).
 
 Requires PHP 8.0+ and Laravel 9, 10, 11, 12 or 13 (Monolog 2 or 3). Every
@@ -19,7 +20,7 @@ the real fix.
 
 ```bash
 composer require songhieu/monitor-track-laravel
-php artisan mt:test          # emits one event of each type and shows where they went
+php artisan mt:test          # sends a log, exception, job, cron run and heartbeat; shows where they went
 ```
 
 On Kubernetes, run the test inside a pod with `--pod-log`:
@@ -75,9 +76,12 @@ These `MT_*` variables are the same in the Go and Python SDKs.
 | `MT_QUEUE_SIZE` | `1000` | http transport: max events buffered per PHP process |
 | `MT_HEARTBEAT_SECONDS` | `15` | queue worker heartbeat interval |
 | `MT_LOG_LEVEL` | `debug` | minimum level of the `monitor-track` log channel |
+| `MT_SLOW_QUERY_MS` | `500` | report queries at least this slow; `0` turns it off |
+| `MT_N_PLUS_ONE` | `10` | report a statement run this many times in one request / job / command (minimum 2); `0` turns it off |
+| `MT_QUERY_THROTTLE_SECONDS` | `60` | at most one query event per statement and call site per window per server; `0` sends every one |
 
 With `MT_TRANSPORT=http` and no `MT_ENDPOINT`, the SDK falls back to `stream`.
-`config/monitor-track.php` also has `capture.exceptions|queue|schedule`
+`config/monitor-track.php` also has `capture.exceptions|queue|schedule|queries`
 switches and the http timeouts.
 
 ## What is captured automatically
@@ -88,10 +92,72 @@ switches and the http timeouts.
 | Queue worker (`JobProcessing`, `JobProcessed`, `JobFailed`, `JobExceptionOccurred`, `JobReleasedAfterException`, `JobTimedOut`) | `job` `start`, then exactly one of `done` / `failed` / `retry` per attempt, with queue, connection, class, uuid, attempts, `runtime_ms`, `timeout_ms` |
 | Queue worker `Looping` | `heartbeat` every `MT_HEARTBEAT_SECONDS`: queues, busy/idle, current job, memory, processed count |
 | Scheduler (`ScheduledTaskStarting`, `Finished`, `Failed`, `Skipped`, `ScheduledBackgroundTaskFinished`) | `cron` `start` / `success` / `fail` / `skip` with name, expression, timezone, exit code, duration and the output tail on failure. The first event registers the task in monitor-track with its schedule. |
+| Database (`QueryExecuted`) | `query` `n_plus_one` / `slow` per request, job, command or scheduled task, with the normalized SQL, count, total and max time, and the call site. See [Slow queries and N+1](#slow-queries-and-n1). |
 
 The task name is the task's `description` if it has one. Otherwise it is the
 artisan command without the PHP binary (for example `invoices:send-reminders`).
 Closures with no `->name()` are named `closure:<file>:<line>`.
+
+## Slow queries and N+1
+
+The SDK listens to Laravel's `QueryExecuted` event and reports two problems
+as `query` events:
+
+- **N+1**: the same statement runs `MT_N_PLUS_ONE` (10) times or more in one
+  request, queued job, artisan command or scheduled task. Usually this is a
+  relation lazy-loaded in a loop. The event has the number of runs, their
+  total and slowest time, and the stack of your code that ran the statement:
+  `frames[0]` is your line, such as the controller loop or the `@foreach` in
+  a compiled Blade view.
+- **Slow query**: a query that takes `MT_SLOW_QUERY_MS` (500 ms) or longer.
+  Slow runs of the same statement from the same line are added up per
+  request or job.
+
+```text
+N+1 query: 37× select * from `users` where `users`.`id` = ? limit ?      GET /orders/{order}
+  app/Http/Controllers/OrderController.php:42  App\Http\Controllers\OrderController->index
+```
+
+Statements are compared by shape: `in (?, ?, ?)` lists become `in (?)`, and
+string and number literals become `?`. The SDK never reads the bindings, so
+no values leave the app, and the SQL sent is at most 2000 bytes. A statement
+repeated only inside framework or vendor code, with none of your code on the
+stack (the migrator, the queue and cache drivers), is not reported as N+1.
+
+Findings are sent when the unit of work ends: after the response for a
+request, and when the job, command or scheduled task finishes. A queue
+worker (`queue:work`, Horizon) and the other long-running commands
+(`schedule:work`, `octane:*`, `reverb:start`, `pulse:*`) are not a unit
+themselves. Each job they run is one, and the worker's own polling queries
+are ignored. Counters start empty for every job and request, so nothing
+builds up in a long-running worker or an Octane process.
+
+**Events are samples.** The SDK sends at most one event per statement and
+call site per `MT_QUERY_THROTTLE_SECONDS` (60) per server. An N+1 endpoint
+serving 100 requests a second sends one event a minute, not 100 a second.
+The count in an event is for that one request or job. The window is kept in
+marker files in the system temp dir (`mt-q-*`), so it works across PHP-FPM
+requests and between FPM and the queue workers. If the temp dir is not
+writable, 1% of the events are sent instead.
+
+To tune it or turn it off:
+
+```dotenv
+MT_SLOW_QUERY_MS=1000            # 0 turns slow-query events off
+MT_N_PLUS_ONE=20                 # 0 turns N+1 events off
+MT_QUERY_THROTTLE_SECONDS=300
+```
+
+With both set to `0`, or `'capture' => ['queries' => false]` in
+`config/monitor-track.php`, the SDK registers no query listener at all.
+
+**Overhead.** Each query costs about 0.5 µs in the SDK: one normalization,
+remembered for repeated SQL, and one counter update. Laravel's own event
+dispatch adds about 1 µs. The SDK only takes a backtrace (under 0.1 ms) when
+a statement reaches the N+1 threshold, once per request or job, and for each
+slow query. Memory per request or job is bounded to 1000 distinct statements
+and 100 findings of each kind. Events are built and throttled when the
+request or job ends, which is after the response under FPM.
 
 ## Logging channel
 
@@ -199,7 +265,11 @@ $this->assertCount(1, $events->events('exception'));
   loaded the user. It never resolves services the app hasn't resolved. It
   never logs through your logger.
 - **Sampling.** `MT_SAMPLE_RATE` thins `log` events. Exceptions, jobs, cron
-  runs and heartbeats are always kept.
+  runs and heartbeats are always kept. `query` events are throttled to one
+  per statement and call site per minute per server.
+- **Cheap query hooks.** About 0.5 µs per query in the SDK. Stacks are only
+  captured when a threshold is crossed, and findings are sent after the
+  response.
 
 ## Known limits
 
@@ -210,3 +280,8 @@ $this->assertCount(1, $events->events('exception'));
 - `runInBackground()` tasks report success or failure from the
   `schedule:finish` process. That process doesn't know the start time, so
   these events carry no `duration_ms`.
+- N+1 counts runs of the same statement per request or job, wherever they
+  come from. The call site reported is the one of the run that reached the
+  threshold.
+- An N+1 in a Blade template points at the compiled view
+  (`storage/framework/views/….php`), not at the `.blade.php` file.

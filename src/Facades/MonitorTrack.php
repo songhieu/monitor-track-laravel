@@ -11,6 +11,7 @@ use MonitorTrack\Client;
  * @method static void job(string $status, array $job, array $context = [])
  * @method static void cron(string $phase, array $cron, array $context = [])
  * @method static void heartbeat(array $heartbeat)
+ * @method static void query(string $kind, array $query)
  * @method static mixed trackJob(string $queue, string $class, callable $fn, array $options = [])
  * @method static mixed trackCron(string $name, ?string $expr, callable $fn, ?string $tz = null)
  * @method static void record(string $type, string $level, string $message, array $fields = [])

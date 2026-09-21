@@ -2,9 +2,10 @@
 
 The monitor-track SDKs (Laravel, Go, Python) add structured data to App Logs
 that raw log lines cannot carry: exceptions with real stack frames, exact queue
-job runs, scheduled-task (cron) runs that register themselves, and worker
-heartbeats. This document is the contract between the SDKs and the backend.
-Every SDK implements it identically.
+job runs, scheduled-task (cron) runs that register themselves, worker
+heartbeats, and slow / N+1 database queries with their call site. This
+document is the contract between the SDKs and the backend. Every SDK
+implements it identically.
 
 - Go: `sdk/go` (`github.com/songhieu/monitor-track/sdk/go`, package `mt`)
 - Python: `sdk/python` (package `monitortrack`)
@@ -28,7 +29,7 @@ Keys are emitted in this order. Empty/unknown fields are **omitted** (never
 | key | type | notes |
 |---|---|---|
 | `_mt` | int | always `1` (wire version), always first |
-| `type` | string | `log` \| `exception` \| `job` \| `cron` \| `heartbeat` |
+| `type` | string | `log` \| `exception` \| `job` \| `cron` \| `heartbeat` \| `query` |
 | `ts` | string | RFC 3339, millisecond precision, numeric offset or `Z`: `2026-09-21T14:31:07.412+07:00` |
 | `level` | string | `debug` \| `info` \| `notice` \| `warning` \| `error` \| `critical` |
 | `message` | string | human-readable; see per-type formats below |
@@ -45,6 +46,7 @@ Keys are emitted in this order. Empty/unknown fields are **omitted** (never
 | `job` | object | `type=job` only |
 | `cron` | object | `type=cron` only |
 | `heartbeat` | object | `type=heartbeat` only |
+| `query` | object | `type=query` only |
 
 Only the object for the event's own type is present.
 
@@ -111,6 +113,27 @@ output / error text.
 Level `debug`, message `Worker heartbeat: {state}`. `job`/`job_started_at`
 only when `state=busy`. `processed` = jobs finished by this process since start.
 
+**query** — a repeated statement (N+1) or a slow query seen in one request,
+job, command or scheduled task (section 10). Laravel only for now.
+```json
+"query":{"kind":"n_plus_one","sql":"select * from `users` where `users`.`id` = ? limit ?","connection":"mysql","count":37,"total_ms":412.5,"max_ms":31.2,"threshold":10,"scope":"request","scope_name":"GET /orders/{order}","frames":[{"file":"app/Http/Controllers/OrderController.php","line":42,"func":"App\\Http\\Controllers\\OrderController->index","in_app":true}]}
+```
+| kind | level | message | `count`, `total_ms`, `max_ms` | `threshold` |
+|---|---|---|---|---|
+| `n_plus_one` | warning | `N+1 query: {count}× {sql}` | every execution of the statement in the scope | N (`MT_N_PLUS_ONE`) |
+| `slow` | warning | `Slow query ({max_ms, rounded}ms): {sql}` | the slow executions from this call site | ms (`MT_SLOW_QUERY_MS`) |
+
+- `sql` is the normalized statement (section 10), ≤ 2000 bytes; the message
+  repeats its first 120 bytes. Bindings are never sent.
+- `connection` is the framework's connection name. `total_ms` and `max_ms`
+  are milliseconds (float, 2 decimals); `count` ≥ 1.
+- `scope` is `request` \| `job` \| `command` \| `schedule`; `scope_name` is the
+  route template, the job class, `artisan {command}` or the task name.
+- `frames` is the call site, innermost first, in the format of exception
+  frames. SDK, framework and vendor frames above the first application frame
+  are dropped, so `frames[0]` is the application line that ran the query. At
+  most 20.
+
 ## 2. Line encoding and size limits
 
 - Exactly one line: no pretty printing, `\n`/`\r` inside strings are JSON
@@ -120,7 +143,8 @@ only when `state=busy`. `processed` = jobs finished by this process since start.
 - Target ≤ **16 KiB** per line (container runtimes split longer lines),
   hard limit **32 KiB** for every transport. Algorithm, applied in order:
   1. Always: `message` ≤ 8 KiB, `exception.message` ≤ 4 KiB, `cron.output`
-     ≤ 8 KiB (tail kept), `frames` ≤ 50.
+     ≤ 8 KiB (tail kept), `frames` ≤ 50 (`query.frames` ≤ 20 and
+     `query.sql` ≤ 2000 bytes when built).
   2. If the encoded line > 16 KiB: `message` ≤ 2 KiB, `exception.message`
      ≤ 1 KiB, `cron.output` ≤ 2 KiB (tail), every string inside `context`
      ≤ 256 bytes.
@@ -219,6 +243,9 @@ Same environment variables in every SDK (options passed in code win):
 | `MT_SAMPLE_RATE` | `1` | 0..1, applies to `type=log` only |
 | `MT_QUEUE_SIZE` | `10000` (Laravel `1000`) | http queue bound |
 | `MT_HEARTBEAT_SECONDS` | `15` | worker heartbeat interval |
+| `MT_SLOW_QUERY_MS` | `500` | (Laravel) report queries at least this slow; `0` = off |
+| `MT_N_PLUS_ONE` | `10` | (Laravel) report a statement run this many times in one scope (minimum 2); `0` = off |
+| `MT_QUERY_THROTTLE_SECONDS` | `60` | (Laravel) at most one query event per statement and call site per window per server; `0` = no throttle |
 
 `MT_TRANSPORT=http` without `MT_ENDPOINT` falls back to `stream`.
 
@@ -229,7 +256,8 @@ Same environment variables in every SDK (options passed in code win):
 2. No network I/O on the request or job path. Default transport is local.
 3. Bounded memory: fixed-size queue, drop newest on overflow (`dropped`).
 4. Sampling for `type=log` (`sampled`); exception, job, cron and heartbeat
-   events are never sampled.
+   events are never sampled. `type=query` events are throttled per statement
+   and call site (section 10).
 5. Shutdown `close`/`flush` always returns by its timeout.
 6. The SDK observes, it does not change control flow: an app exception inside
    a job/cron helper is recorded and then propagates exactly as before (Go
@@ -297,4 +325,81 @@ skipped by sampling), `errors` (swallowed internal errors).
 
 ```
 {"_mt":1,"type":"log","ts":"2026-09-21T14:31:07.412+07:00","level":"warning","message":"Payment retry scheduled","app":"billing-api","env":"production","host":"billing-api-7d9f8c6b5-x2kqp","pid":41,"trace_id":"4bf92f3577b34da6a3ce929d0e0e4736","route":"POST /api/v1/payments","context":{"order_id":991,"attempt":2}}
+```
+
+## 10. Slow queries and N+1 (type=query)
+
+Laravel only for now, from Laravel's `QueryExecuted` event.
+
+### Scopes
+
+Queries are counted per unit of work, and its findings are sent when it ends:
+
+| scope | starts | ends | `scope_name` |
+|---|---|---|---|
+| `request` | the process (Octane: `RequestReceived`) | the app's terminating callbacks, after the response under FPM | route template, `GET /orders/{order}`; `GET (no route)` when none matched |
+| `job` | `JobProcessing` | the first of `JobProcessed`, `JobFailed`, `JobExceptionOccurred`, `JobReleasedAfterException`, `JobTimedOut` | job class |
+| `command` | `CommandStarting` | `CommandFinished` | `artisan {command}` |
+| `schedule` | `ScheduledTaskStarting` (in-process tasks) | `ScheduledTaskFinished` / `ScheduledTaskFailed` | task name (section 7) |
+
+- Scopes nest (a sync job inside a request); a query counts in the innermost
+  open one. A scope still open on terminating ends there.
+- Long-running commands are not scopes: `queue:work`, `queue:listen`,
+  `horizon`, `horizon:work`, `horizon:supervisor`, `schedule:work`,
+  `octane:*`, `reverb:start`, `pulse:check`, `pulse:work`. Their jobs are.
+  Queries a worker makes between jobs (polling the database queue) are not
+  counted; a queue worker is also recognized by its `Looping` event.
+- Queries outside any scope are evaluated on terminating as `request` (when
+  a route matched) or `command` (`artisan {command}` from argv).
+- Every scope starts with empty counters, so a worker or an Octane process
+  carries nothing from one job or request to the next.
+
+### Normalization
+
+The statement's identity is its connection plus its normalized SQL, which is
+also the only SQL that is sent (a privacy measure: bindings are never read,
+and raw SQL can contain values):
+
+1. string literals (`'…'`, and `"…"` on MySQL / MariaDB where it is a string)
+   and bare numbers (`42`, `-1.5e3` → `-?`, `0x1F`) become `?`; quoted
+   identifiers and digits inside names (`t1`, `order_2024`, `$1`) are kept;
+2. `in (?, ?, …)` becomes `in (?)`;
+3. runs of whitespace become one space;
+4. the result is cut to 2000 bytes (`…` appended).
+
+```
+select * from `users` where `users`.`id` = ? limit 1       →  select * from `users` where `users`.`id` = ? limit ?
+select * from "orders" where "customer_id" in (?, ?, ?)    →  select * from "orders" where "customer_id" in (?)
+update users set name = 'Ann', age = 42                    →  update users set name = ?, age = ?
+```
+
+### Detection
+
+- **N+1**: a statement executed at least N times in one scope. One event per
+  statement per scope, with the scope's final `count`, `total_ms` and
+  `max_ms`. The stack is taken from the execution that reaches N, and its
+  `frames[0]` is the reported call site. Statements with no application frame
+  on the stack (the migrator, queue and cache drivers) are not reported.
+- **slow**: every execution that takes at least the threshold. Aggregated per
+  statement and call site within the scope: `count` slow executions, their
+  total and the slowest.
+- Cost per query: one memoized normalization and one counter update. A
+  backtrace is only taken when a statement reaches N and for each slow query.
+  Per scope, at most 1000 distinct statements are counted and 100 findings of
+  each kind kept.
+
+### Throttle
+
+An N+1 endpoint at 100 requests/s must not send 100 events/s, and PHP-FPM
+keeps no state between requests. Before sending, the SDK checks a marker file
+`{temp dir}/mt-q-{md5(kind, connection, sql, call site, base path)}`: if its
+mtime is less than `MT_QUERY_THROTTLE_SECONDS` old the event is skipped,
+otherwise the file is touched and the event sent. Without a writable temp
+dir, 1% of the events are sent. Query events are therefore **samples**: at
+most one per statement and call site per window per server, and `count`
+describes that one scope, not a rate.
+
+```
+{"_mt":1,"type":"query","ts":"2026-09-21T14:31:07.412+07:00","level":"warning","message":"N+1 query: 37× select * from `users` where `users`.`id` = ? limit ?","app":"billing-api","env":"production","release":"2026.09.21-2","host":"billing-api-7d9f8c6b5-x2kqp","pid":41,"trace_id":"4bf92f3577b34da6a3ce929d0e0e4736","route":"GET /orders/{order}","query":{"kind":"n_plus_one","sql":"select * from `users` where `users`.`id` = ? limit ?","connection":"mysql","count":37,"total_ms":412.5,"max_ms":31.2,"threshold":10,"scope":"request","scope_name":"GET /orders/{order}","frames":[{"file":"app/Http/Controllers/OrderController.php","line":42,"func":"App\\Http\\Controllers\\OrderController->index","in_app":true},{"file":"vendor/laravel/framework/src/Illuminate/Routing/Controller.php","line":54,"func":"Illuminate\\Routing\\Controller->callAction","in_app":false}]}}
+{"_mt":1,"type":"query","ts":"2026-09-21T02:00:41.905+07:00","level":"warning","message":"Slow query (2310ms): select sum(`total`) from `invoices` where `issued_at` between ? and ?","app":"billing-api","env":"production","host":"billing-worker-5c7d9-abcde","pid":12,"query":{"kind":"slow","sql":"select sum(`total`) from `invoices` where `issued_at` between ? and ?","connection":"mysql","count":1,"total_ms":2310.4,"max_ms":2310.4,"threshold":500,"scope":"job","scope_name":"App\\Jobs\\BuildMonthlyReport","frames":[{"file":"app/Reports/Revenue.php","line":88,"func":"App\\Reports\\Revenue->total","in_app":true}]}}
 ```

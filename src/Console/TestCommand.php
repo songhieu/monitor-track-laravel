@@ -7,7 +7,8 @@ use MonitorTrack\Client;
 use MonitorTrack\Transport\StreamTransport;
 
 /**
- * `php artisan mt:test` — emits one event of each type and shows where they went.
+ * `php artisan mt:test` — sends a log, an exception, a job, a cron run and a heartbeat
+ * (not a query sample: those need a real slow query or N+1) and shows where they went.
  */
 class TestCommand extends Command
 {

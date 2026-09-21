@@ -4,6 +4,7 @@ namespace MonitorTrack;
 
 use MonitorTrack\Support\EnvelopeEncoder;
 use MonitorTrack\Support\Masker;
+use MonitorTrack\Support\SqlNormalizer;
 use MonitorTrack\Support\StackTrace;
 use MonitorTrack\Transport\FileTransport;
 use MonitorTrack\Transport\HttpTransport;
@@ -38,6 +39,12 @@ class Client
 
     private int $heartbeatSeconds;
 
+    private float $slowQueryMs;
+
+    private int $nPlusOne;
+
+    private int $queryThrottleSeconds;
+
     private string $basePath;
 
     /** @var (callable(): array<string, string>)|null */
@@ -62,6 +69,9 @@ class Client
         $this->enabled = $o['enabled'];
         $this->sampleRate = $o['sample_rate'];
         $this->heartbeatSeconds = $o['heartbeat_seconds'];
+        $this->slowQueryMs = $o['slow_query_ms'];
+        $this->nPlusOne = $o['n_plus_one'];
+        $this->queryThrottleSeconds = $o['query_throttle_seconds'];
         $this->basePath = $o['base_path'];
         $this->base = [
             'app' => $o['app'],
@@ -92,11 +102,27 @@ class Client
      * @param  array<string, mixed>  $raw
      * @return array{enabled:bool, transport:string, stream:string, file:string, endpoint:string, token:string,
      *     app:string, env:string, release:string, host:string, sample_rate:float, queue_size:int,
-     *     heartbeat_seconds:int, base_path:string, http_connect_timeout_ms:int, http_timeout_ms:int}
+     *     heartbeat_seconds:int, slow_query_ms:float, n_plus_one:int, query_throttle_seconds:int,
+     *     base_path:string, http_connect_timeout_ms:int, http_timeout_ms:int}
      */
     public static function normalizeOptions(array $raw): array
     {
         $str = static fn ($v): string => is_scalar($v) ? trim((string) $v) : '';
+
+        // A threshold: empty keeps the default, false / off turns it off (0).
+        $threshold = static function ($v, float $default) use ($str): float {
+            if ($v === null || $v === '' || $v === true) {
+                return $default;
+            }
+            if ($v === false) {
+                return 0.0;
+            }
+            if (is_numeric($v)) {
+                return max(0.0, (float) $v);
+            }
+
+            return in_array(strtolower($str($v)), ['false', 'off', 'no', '(false)'], true) ? 0.0 : $default;
+        };
 
         $enabled = $raw['enabled'] ?? true;
         if (! is_bool($enabled)) {
@@ -122,6 +148,10 @@ class Client
         $heartbeat = $raw['heartbeat_seconds'] ?? 15;
         $heartbeat = is_numeric($heartbeat) && (int) $heartbeat > 0 ? (int) $heartbeat : 15;
 
+        // The same statement once is not a repetition: the minimum is 2.
+        $nPlusOne = (int) $threshold($raw['n_plus_one'] ?? null, 10.0);
+        $nPlusOne = $nPlusOne > 0 ? max(2, $nPlusOne) : 0;
+
         $host = $str($raw['host'] ?? '');
         if ($host === '') {
             $host = (string) (@gethostname() ?: '');
@@ -141,6 +171,9 @@ class Client
             'sample_rate' => max(0.0, min(1.0, $sample)),
             'queue_size' => $queue,
             'heartbeat_seconds' => $heartbeat,
+            'slow_query_ms' => $threshold($raw['slow_query_ms'] ?? null, 500.0),
+            'n_plus_one' => $nPlusOne,
+            'query_throttle_seconds' => (int) $threshold($raw['query_throttle_seconds'] ?? null, 60.0),
             'base_path' => rtrim($str($raw['base_path'] ?? ''), '/\\'),
             'http_connect_timeout_ms' => (int) ($raw['http_connect_timeout_ms'] ?? 500),
             'http_timeout_ms' => (int) ($raw['http_timeout_ms'] ?? 1000),
@@ -204,6 +237,45 @@ class Client
     public function heartbeatSeconds(): int
     {
         return $this->heartbeatSeconds;
+    }
+
+    /**
+     * Queries at least this slow (ms) are reported; 0 = off.
+     */
+    public function slowQueryMs(): float
+    {
+        return $this->slowQueryMs;
+    }
+
+    /**
+     * A statement run this many times in one request / job / command is
+     * reported as N+1; 0 = off.
+     */
+    public function nPlusOne(): int
+    {
+        return $this->nPlusOne;
+    }
+
+    /**
+     * At most one query event per statement and call site per this many
+     * seconds on one server; 0 = no throttle.
+     */
+    public function queryThrottleSeconds(): int
+    {
+        return $this->queryThrottleSeconds;
+    }
+
+    /**
+     * Frame paths are relative to this directory (the app's base_path()).
+     */
+    public function basePath(): string
+    {
+        return $this->basePath;
+    }
+
+    public function setBasePath(string $basePath): void
+    {
+        $this->basePath = rtrim($basePath, '/\\');
     }
 
     /**
@@ -421,6 +493,46 @@ class Client
     }
 
     /**
+     * A slow or repeated (N+1) database query (type=query). The query
+     * listener sends these when a request, job, command or scheduled task
+     * ends.
+     *
+     * @param  string  $kind  n_plus_one | slow
+     * @param  array{sql?:string, connection?:string|null, count?:int, total_ms?:float, max_ms?:float, threshold?:int|float,
+     *     scope?:string, scope_name?:string|null, frames?:list<array{file:string, line:int, func:string, in_app:bool}>}  $query
+     */
+    public function query(string $kind, array $query): void
+    {
+        if (! $this->enabled) {
+            return;
+        }
+
+        $sql = EnvelopeEncoder::head((string) ($query['sql'] ?? ''), SqlNormalizer::MAX_LENGTH);
+        $count = max(1, (int) ($query['count'] ?? 1));
+        $max = round((float) ($query['max_ms'] ?? 0), 2);
+        $short = EnvelopeEncoder::head($sql, 120);
+
+        $message = $kind === 'slow'
+            ? 'Slow query ('.(int) round($max).'ms): '.$short
+            : "N+1 query: {$count}× {$short}";
+
+        $payload = [
+            'kind' => $kind,
+            'sql' => $sql,
+            'connection' => $query['connection'] ?? null,
+            'count' => $count,
+            'total_ms' => round((float) ($query['total_ms'] ?? 0), 2),
+            'max_ms' => $max,
+            'threshold' => $query['threshold'] ?? null,
+            'scope' => $query['scope'] ?? null,
+            'scope_name' => isset($query['scope_name']) ? EnvelopeEncoder::head((string) $query['scope_name'], 200) : null,
+            'frames' => array_values($query['frames'] ?? []),
+        ];
+
+        $this->record('query', 'warning', $message, ['query' => $payload]);
+    }
+
+    /**
      * Runs $fn as a tracked job outside Laravel's queue (start, then done or
      * failed with runtime). An exception from $fn is captured and rethrown
      * unchanged: the SDK observes, it does not alter control flow.
@@ -503,7 +615,7 @@ class Client
     /**
      * Low-level: build, encode and send one envelope.
      *
-     * @param  array<string, mixed>  $fields  context, exception, job, cron, heartbeat, trace_id, user_id, route
+     * @param  array<string, mixed>  $fields  context, exception, job, cron, heartbeat, query, trace_id, user_id, route
      */
     public function record(string $type, string $level, string $message, array $fields = []): void
     {
@@ -586,7 +698,7 @@ class Client
             }
         }
 
-        foreach (['exception', 'job', 'cron', 'heartbeat'] as $key) {
+        foreach (['exception', 'job', 'cron', 'heartbeat', 'query'] as $key) {
             if ($key === $type && isset($fields[$key]) && is_array($fields[$key])) {
                 $e[$key] = self::withoutEmpty($fields[$key]);
             }
