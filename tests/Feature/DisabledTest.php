@@ -3,6 +3,7 @@
 namespace MonitorTrack\Tests\Feature;
 
 use Illuminate\Queue\Events\JobProcessing;
+use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\Log;
 use MonitorTrack\Tests\Fixtures\TestQueueJob;
 use MonitorTrack\Tests\TestCase;
@@ -27,6 +28,9 @@ class DisabledTest extends TestCase
         report(new \RuntimeException('ignored'));
 
         $this->assertSame(['emitted' => 0, 'dropped' => 0, 'sampled' => 0, 'errors' => 0], $client->stats());
-        $this->artisan('mt:test')->expectsOutputToContain('disabled')->assertExitCode(0);
+        // Artisan::output() rather than expectsOutputToContain(), which Laravel 9.0 lacks.
+        $this->withoutMockingConsoleOutput();
+        $this->assertSame(0, Artisan::call('mt:test'));
+        $this->assertStringContainsString('disabled', Artisan::output());
     }
 }

@@ -12,7 +12,7 @@ use MonitorTrack\Client;
  */
 final class ChannelFactory
 {
-    public function __construct(private readonly ?Client $client = null)
+    public function __construct(private ?Client $client = null)
     {
     }
 

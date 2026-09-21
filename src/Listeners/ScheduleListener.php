@@ -32,7 +32,7 @@ final class ScheduleListener
 
     private string $defaultTimezone;
 
-    public function __construct(private readonly Client $client, ?string $defaultTimezone = null)
+    public function __construct(private Client $client, ?string $defaultTimezone = null)
     {
         $this->defaultTimezone = $defaultTimezone ?: date_default_timezone_get();
     }
@@ -193,7 +193,11 @@ final class ScheduleListener
 
         if ($task instanceof CallbackEvent) {
             try {
-                $callback = (new \ReflectionProperty(CallbackEvent::class, 'callback'))->getValue($task);
+                $prop = new \ReflectionProperty(CallbackEvent::class, 'callback');
+                if (PHP_VERSION_ID < 80100) {
+                    $prop->setAccessible(true); // a no-op since 8.1, deprecated in 8.5
+                }
+                $callback = $prop->getValue($task);
                 if (is_string($callback)) {
                     return EnvelopeEncoder::head($callback, 200);
                 }

@@ -11,7 +11,7 @@ use Illuminate\Contracts\Foundation\Application;
  */
 final class RequestScope
 {
-    public function __construct(private readonly Application $app)
+    public function __construct(private Application $app)
     {
     }
 

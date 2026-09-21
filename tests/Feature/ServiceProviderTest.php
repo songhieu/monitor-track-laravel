@@ -8,6 +8,7 @@ use MonitorTrack\Monolog\Handler;
 use MonitorTrack\Tests\TestCase;
 use MonitorTrack\Transport\StreamTransport;
 use Monolog\Level;
+use Monolog\Logger;
 use Monolog\LogRecord;
 
 class ServiceProviderTest extends TestCase
@@ -63,8 +64,11 @@ class ServiceProviderTest extends TestCase
 
     public function test_monolog_handler_maps_levels_and_never_throws(): void
     {
-        $this->assertSame('critical', Handler::level(Level::Emergency));
-        $this->assertSame('notice', Handler::level(Level::Notice));
+        // Monolog 3 (Laravel 10+) levels are an enum, Monolog 2 (Laravel 9) ints.
+        $monolog3 = Logger::API >= 3;
+        $this->assertSame('critical', Handler::level($monolog3 ? Level::Emergency : Logger::EMERGENCY));
+        $this->assertSame('notice', Handler::level($monolog3 ? Level::Notice : Logger::NOTICE));
+        $this->assertSame('warning', Handler::level($monolog3 ? Level::Warning : Logger::WARNING));
 
         $memory = $this->fake();
         $handler = new Handler($this->client());
@@ -72,7 +76,10 @@ class ServiceProviderTest extends TestCase
             throw new \RuntimeException('broken processor');
         });
 
-        $record = new LogRecord(new \DateTimeImmutable, 'app', Level::Info, 'x');
+        $record = $monolog3
+            ? new LogRecord(new \DateTimeImmutable, 'app', Level::Info, 'x')
+            : ['message' => 'x', 'context' => [], 'level' => Logger::INFO, 'level_name' => 'INFO',
+                'channel' => 'app', 'datetime' => new \DateTimeImmutable, 'extra' => []];
         $this->assertFalse($handler->handle($record), 'bubbles, does not throw');
         $this->assertSame([], $memory->lines());
     }

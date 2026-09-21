@@ -40,7 +40,7 @@ final class QueueListener
 
     private float $lastHeartbeat = 0.0;
 
-    public function __construct(private readonly Client $client)
+    public function __construct(private Client $client)
     {
     }
 

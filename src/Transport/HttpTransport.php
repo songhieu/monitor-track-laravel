@@ -34,12 +34,12 @@ final class HttpTransport implements Transport
      *                                                                                               replaces the curl call (tests)
      */
     public function __construct(
-        private readonly string $endpoint,
-        private readonly ?string $token,
-        private readonly int $maxBuffer,
-        private readonly Stats $stats,
-        private readonly int $connectTimeoutMs = 500,
-        private readonly int $timeoutMs = 1000,
+        private string $endpoint,
+        private ?string $token,
+        private int $maxBuffer,
+        private Stats $stats,
+        private int $connectTimeoutMs = 500,
+        private int $timeoutMs = 1000,
         ?callable $sender = null,
     ) {
         $this->sender = $sender;
@@ -207,7 +207,8 @@ final class HttpTransport implements Transport
         curl_exec($ch);
         $errno = curl_errno($ch);
         $status = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
-        curl_close($ch);
+        // No curl_close(): a no-op since PHP 8.0 and deprecated in 8.5; the
+        // handle is freed when $ch goes out of scope.
 
         if ($errno !== 0) {
             // 7 couldn't connect, 52 empty reply, 55 send error, 56 recv error

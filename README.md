@@ -9,10 +9,11 @@ frames, exact queue job runs, scheduled task runs that register themselves,
 and queue worker heartbeats. The wire format is described in
 [`docs/sdk-spec.md`](docs/sdk-spec.md).
 
-Requires PHP 8.1+ and Laravel 10, 11, 12 or 13 (Monolog 3). Every
-combination is tested in CI, including the lowest supported versions.
-Laravel 10 and 11 no longer receive security fixes; Composer 2.10+ refuses
-to install them while they have open advisories — upgrading is the real fix.
+Requires PHP 8.0+ and Laravel 9, 10, 11, 12 or 13 (Monolog 2 or 3). Every
+combination is tested in CI on PHP 8.0–8.5, including the lowest supported
+versions. Laravel 9, 10 and 11 no longer receive security fixes; Composer
+2.10+ refuses to install them while they have open advisories — upgrading is
+the real fix.
 
 ## Install
 
@@ -98,11 +99,13 @@ or `exception` events when the context has an `exception`:
 Pick the setup that matches your transport:
 
 - **stream transport (default):** replace `stderr` with `monitor-track`, for
-  example `LOG_STACK=monitor-track` (Laravel 11) or
-  `'channels' => ['monitor-track']` in the `stack` channel (Laravel 10). Both
+  example `LOG_STACK=monitor-track` (Laravel 11+) or
+  `'channels' => ['monitor-track']` in the `stack` channel of
+  `config/logging.php` (Laravel 9 and 10, which have no `LOG_STACK`). Both
   channels write to stderr, so `LOG_STACK=stderr,monitor-track` would print
   every line twice.
-- **file / http transport:** `LOG_STACK=stderr,monitor-track` is fine. stderr
+- **file / http transport:** `LOG_STACK=stderr,monitor-track` (Laravel 11+)
+  or `['single', 'monitor-track']` (Laravel 9/10) is fine. The first channel
   stays human-readable, and the structured copy goes to the file or the
   ingest API. If the backend also reads this pod's stdout, you will see both
   copies.

@@ -10,7 +10,7 @@ final class MemoryTransport implements Transport
     /** @var list<string> */
     private array $lines = [];
 
-    public function __construct(private readonly int $max = 10000)
+    public function __construct(private int $max = 10000)
     {
     }
 

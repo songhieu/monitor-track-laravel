@@ -20,7 +20,7 @@ final class StreamTransport implements Transport
     /**
      * @param  string|resource  $target  a php:// stream name or an open stream resource
      */
-    public function __construct($target, private readonly Stats $stats)
+    public function __construct($target, private Stats $stats)
     {
         if (is_resource($target)) {
             $this->handle = $target;

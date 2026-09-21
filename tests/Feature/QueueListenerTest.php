@@ -44,6 +44,9 @@ class QueueListenerTest extends TestCase
 
     public function test_exception_then_release_emits_exactly_one_retry(): void
     {
+        if (! class_exists(JobReleasedAfterException::class)) {
+            $this->markTestSkipped('JobReleasedAfterException arrived in Laravel 9.x');
+        }
         $memory = $this->fake();
         $job = TestQueueJob::make('retry-uuid', 1);
 

@@ -13,7 +13,7 @@ final class FileTransport implements Transport
 {
     private float $retryAt = 0.0;
 
-    public function __construct(private readonly string $path, private readonly Stats $stats)
+    public function __construct(private string $path, private Stats $stats)
     {
     }
 
