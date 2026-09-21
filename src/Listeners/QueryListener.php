@@ -7,8 +7,8 @@ use Illuminate\Console\Events\CommandStarting;
 use Illuminate\Console\Events\ScheduledTaskFailed;
 use Illuminate\Console\Events\ScheduledTaskFinished;
 use Illuminate\Console\Events\ScheduledTaskStarting;
+use Illuminate\Container\Container;
 use Illuminate\Contracts\Events\Dispatcher;
-use Illuminate\Contracts\Foundation\Application;
 use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Queue\Events\JobExceptionOccurred;
 use Illuminate\Queue\Events\JobFailed;
@@ -18,6 +18,7 @@ use Illuminate\Queue\Events\JobReleasedAfterException;
 use Illuminate\Queue\Events\JobTimedOut;
 use Illuminate\Queue\Events\Looping;
 use Illuminate\Queue\Jobs\SyncJob;
+use Illuminate\Support\Str;
 use MonitorTrack\Client;
 use MonitorTrack\Support\QueryScope;
 use MonitorTrack\Support\QueryThrottle;
@@ -36,11 +37,16 @@ use MonitorTrack\Support\StackTrace;
  *   job:       JobProcessing → JobProcessed / JobFailed / JobExceptionOccurred
  *              / JobReleasedAfterException / JobTimedOut
  *   command:   CommandStarting → CommandFinished; long-running commands
- *              (queue:work, horizon, octane:*, …) are not scopes, their jobs are
+ *              (queue:work, horizon, octane:*, …, MT_LONG_RUNNING_COMMANDS)
+ *              are not scopes, their jobs are
  *   schedule:  ScheduledTaskStarting → ScheduledTaskFinished / ScheduledTaskFailed
  * Queries outside these belong to the process and are evaluated on
  * terminating as "request" or "command". Scopes nest (a sync job inside a
  * request); a query counts in the innermost open one.
+ *
+ * Under Octane one process serves many requests, each from its own clone of
+ * the application: the listener keeps no container, it reads the current one
+ * when a scope ends, and every request, task and tick starts from nothing.
  */
 final class QueryListener
 {
@@ -95,7 +101,7 @@ final class QueryListener
     /** @var array<string, bool> connection => "…" is a string literal */
     private array $doubleQuotedStrings = [];
 
-    public function __construct(private Client $client, private Application $app, ?QueryThrottle $throttle = null)
+    public function __construct(private Client $client, ?QueryThrottle $throttle = null)
     {
         $this->slowMs = $client->slowQueryMs();
         $this->slowThreshold = fmod($this->slowMs, 1.0) === 0.0 ? (int) $this->slowMs : $this->slowMs;
@@ -128,8 +134,13 @@ final class QueryListener
         $events->listen(ScheduledTaskFinished::class, [$this, 'taskFinished']);
         $events->listen(ScheduledTaskFailed::class, [$this, 'taskFinished']);
 
-        // Octane serves many requests from one process.
-        $events->listen('Laravel\Octane\Events\RequestReceived', [$this, 'requestReceived']);
+        // Octane serves many requests (and, in task workers, tasks and ticks)
+        // from one process. Listened to by name: Octane is not a dependency.
+        $events->listen([
+            'Laravel\Octane\Events\RequestReceived',
+            'Laravel\Octane\Events\TaskReceived',
+            'Laravel\Octane\Events\TickReceived',
+        ], [$this, 'requestReceived']);
     }
 
     public function setThrottle(QueryThrottle $throttle): void
@@ -219,7 +230,7 @@ final class QueryListener
         try {
             $name = (string) $event->command;
 
-            if (self::isLongRunning($name)) {
+            if ($this->isLongRunning($name)) {
                 $this->longRunning++;
                 $this->root = new QueryScope;
                 $this->refresh();
@@ -237,7 +248,7 @@ final class QueryListener
         try {
             $name = (string) $event->command;
 
-            if (self::isLongRunning($name)) {
+            if ($this->isLongRunning($name)) {
                 $this->longRunning = max(0, $this->longRunning - 1);
                 $this->refresh();
 
@@ -270,8 +281,8 @@ final class QueryListener
     }
 
     /**
-     * Octane: a new request starts from nothing, whatever the previous one
-     * left behind.
+     * Octane: a new request, task or tick starts from nothing, whatever the
+     * previous one left behind.
      */
     public function requestReceived(): void
     {
@@ -451,9 +462,19 @@ final class QueryListener
         return $this->worker || $this->longRunning > 0;
     }
 
-    private static function isLongRunning(string $command): bool
+    private function isLongRunning(string $command): bool
     {
-        return in_array($command, self::LONG_RUNNING, true) || str_starts_with($command, 'octane:');
+        if (in_array($command, self::LONG_RUNNING, true) || str_starts_with($command, 'octane:')) {
+            return true;
+        }
+
+        foreach ($this->client->longRunningCommands() as $pattern) {
+            if (Str::is($pattern, $command)) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private function end(QueryScope $scope): void
@@ -510,16 +531,18 @@ final class QueryListener
      */
     private function describeProcess(): array
     {
-        $route = (new RequestScope($this->app))()['route'] ?? null;
+        $app = Container::getInstance();
+
+        $route = (new RequestScope($app))()['route'] ?? null;
         if ($route !== null) {
             return ['request', $route];
         }
 
-        if (! $this->app->runningInConsole()) {
+        if (method_exists($app, 'runningInConsole') && ! $app->runningInConsole()) {
             $method = 'GET';
             try {
-                if ($this->app->resolved('request')) {
-                    $method = strtoupper((string) $this->app->make('request')->getMethod());
+                if ($app->resolved('request')) {
+                    $method = strtoupper((string) $app->make('request')->getMethod());
                 }
             } catch (\Throwable) {
             }

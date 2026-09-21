@@ -18,6 +18,10 @@ use MonitorTrack\Client;
  * Queue worker events → job start/done/failed/retry, worker heartbeats and
  * the http flush cadence of long-running workers.
  *
+ * Heartbeats come only from a process that runs a worker loop (Looping): a
+ * sync job inside a web request or an Octane worker is a job run, but that
+ * process is not a queue worker.
+ *
  * Laravel's event order per attempt:
  *   success:     JobProcessing → JobProcessed
  *   retry:       JobProcessing → JobExceptionOccurred → JobReleasedAfterException
@@ -39,6 +43,9 @@ final class QueueListener
     private int $processed = 0;
 
     private float $lastHeartbeat = 0.0;
+
+    /** A queue worker loop (Looping) runs in this process. */
+    private bool $worker = false;
 
     public function __construct(private Client $client)
     {
@@ -128,6 +135,8 @@ final class QueueListener
 
     public function looping(Looping $event): void
     {
+        $this->worker = true;
+
         try {
             $queues = array_values(array_filter(array_map('trim', explode(',', (string) $event->queue))));
             if ($queues !== []) {
@@ -148,6 +157,10 @@ final class QueueListener
 
     private function heartbeatIfDue(): void
     {
+        if (! $this->worker) {
+            return;
+        }
+
         $now = microtime(true);
         if ($now - $this->lastHeartbeat < $this->client->heartbeatSeconds()) {
             return;

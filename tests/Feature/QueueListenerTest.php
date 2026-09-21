@@ -126,6 +126,22 @@ class QueueListenerTest extends TestCase
         $this->assertSame('Worker heartbeat: idle', $beats[0]['message']);
     }
 
+    public function test_a_sync_job_outside_a_worker_sends_no_heartbeat(): void
+    {
+        $memory = $this->fake();
+        $job = TestQueueJob::make();
+
+        // dispatch_sync() in a web request or an Octane worker.
+        event(new JobProcessing('sync', $job));
+        event(new JobProcessed('sync', $job));
+
+        $this->assertCount(2, $memory->events('job'));
+        $this->assertSame([], $memory->events('heartbeat'), 'that process is not a queue worker');
+
+        event(new Looping('redis', 'default'));
+        $this->assertCount(1, $memory->events('heartbeat'));
+    }
+
     public function test_listener_errors_never_reach_the_worker(): void
     {
         $memory = $this->fake();

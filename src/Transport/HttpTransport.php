@@ -9,9 +9,15 @@ use MonitorTrack\Stats;
  * POSTs them as gzip NDJSON to {endpoint}/api/v1/logs/ingest.
  *
  * Nothing is sent while a request or job runs. The service provider flushes
- * from app()->terminating() (after the response under FPM), from the queue
- * worker's Looping event (every 2 s / 500 lines) and from a shutdown function.
- * A failed batch is dropped: one quick retry on a connection error, no loops.
+ * from app()->terminating() (after the response under FPM; under Octane only
+ * when due), from the queue worker's Looping event (every 2 s / 500 lines)
+ * and from a shutdown function. A failed batch is dropped: one quick retry on
+ * a connection error, no loops.
+ *
+ * When the ingest can't be reached or answers 429 / 502-504, long-running
+ * processes stop trying for a while (5 s, doubling up to 60 s): flushIfDue()
+ * keeps buffering (bounded) and flush() drops the buffer at once, so an
+ * outage never stalls a worker on every flush.
  */
 final class HttpTransport implements Transport
 {
@@ -21,10 +27,19 @@ final class HttpTransport implements Transport
 
     public const FLUSH_INTERVAL = 2.0;
 
+    private const MIN_BACKOFF = 5.0;
+
+    private const MAX_BACKOFF = 60.0;
+
     /** @var list<string> */
     private array $buffer = [];
 
     private float $lastFlush;
+
+    /** No flush before this microtime(true): the ingest failed recently. */
+    private float $retryAt = 0.0;
+
+    private float $backoff = 0.0;
 
     /** @var (callable(string, list<string>, string): array{status:int, retryable:bool})|null */
     private $sender;
@@ -70,9 +85,17 @@ final class HttpTransport implements Transport
     public function flushIfDue(): void
     {
         $n = count($this->buffer);
+        if ($n === 0) {
+            return;
+        }
 
-        if ($n >= self::BATCH_LINES || ($n > 0 && microtime(true) - $this->lastFlush >= self::FLUSH_INTERVAL)) {
-            $this->flush(microtime(true) + 3.0);
+        $now = microtime(true);
+        if ($now < $this->retryAt) {
+            return;
+        }
+
+        if ($n >= self::BATCH_LINES || $now - $this->lastFlush >= self::FLUSH_INTERVAL) {
+            $this->flush($now + 3.0);
         }
     }
 
@@ -81,6 +104,15 @@ final class HttpTransport implements Transport
         $this->lastFlush = microtime(true);
 
         try {
+            if ($this->buffer !== [] && $this->lastFlush < $this->retryAt) {
+                // The ingest failed moments ago: give up now instead of
+                // waiting for another timeout.
+                $this->stats->dropped += count($this->buffer);
+                $this->buffer = [];
+
+                return;
+            }
+
             while ($this->buffer !== []) {
                 if ($deadline !== null && microtime(true) >= $deadline) {
                     $this->stats->dropped += count($this->buffer);
@@ -90,8 +122,23 @@ final class HttpTransport implements Transport
                 }
 
                 $batch = $this->takeBatch();
-                if (! $this->post($batch)) {
-                    $this->stats->dropped += count($batch);
+                $status = $this->post($batch);
+
+                if ($status >= 200 && $status < 300) {
+                    $this->backoff = 0.0;
+
+                    continue;
+                }
+
+                $this->stats->dropped += count($batch);
+
+                if ($status === 0 || $status === 429 || ($status >= 502 && $status <= 504)) {
+                    // Unreachable or overloaded: the rest waits for a flush
+                    // after the backoff.
+                    $this->backoff = min(self::MAX_BACKOFF, max(self::MIN_BACKOFF, $this->backoff * 2));
+                    $this->retryAt = microtime(true) + $this->backoff;
+
+                    return;
                 }
             }
         } catch (\Throwable) {
@@ -123,8 +170,9 @@ final class HttpTransport implements Transport
 
     /**
      * @param  list<string>  $batch
+     * @return int the response status, 0 = no response
      */
-    private function post(array $batch): bool
+    private function post(array $batch): int
     {
         $body = implode('', $batch);
         $headers = [
@@ -158,7 +206,7 @@ final class HttpTransport implements Transport
             $this->stats->errors++;
         }
 
-        return $result['status'] >= 200 && $result['status'] < 300;
+        return $result['status'];
     }
 
     /**

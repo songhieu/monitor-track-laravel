@@ -17,14 +17,17 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 use MonitorTrack\Listeners\QueryListener;
 use MonitorTrack\MonitorTrackServiceProvider;
+use MonitorTrack\Stats;
 use MonitorTrack\Support\QueryThrottle;
 use MonitorTrack\Tests\Fixtures\App\Console\BuildReports;
+use MonitorTrack\Tests\Fixtures\App\Console\DistributionSupervisor;
 use MonitorTrack\Tests\Fixtures\App\Http\OrderController;
 use MonitorTrack\Tests\Fixtures\App\Jobs\SyncStock;
 use MonitorTrack\Tests\Fixtures\App\Services\CustomerLookup;
 use MonitorTrack\Tests\Fixtures\App\Services\ReportRepository;
 use MonitorTrack\Tests\Fixtures\TestQueueJob;
 use MonitorTrack\Tests\TestCase;
+use MonitorTrack\Transport\HttpTransport;
 use Symfony\Component\Console\Input\ArrayInput;
 use Symfony\Component\Console\Output\NullOutput;
 
@@ -40,7 +43,7 @@ class QueryListenerTest extends TestCase
     {
         $this->base = (string) realpath(__DIR__.'/../Fixtures');
         foreach (['Models/Customer', 'Models/Order', 'Http/OrderController', 'Services/CustomerLookup',
-            'Services/ReportRepository', 'Jobs/SyncStock', 'Console/BuildReports'] as $file) {
+            'Services/ReportRepository', 'Jobs/SyncStock', 'Console/BuildReports', 'Console/DistributionSupervisor'] as $file) {
             require_once $this->base.'/app/'.$file.'.php';
         }
 
@@ -73,6 +76,7 @@ class QueryListenerTest extends TestCase
         $app['config']->set('database.default', 'testing');
         $app['config']->set('database.connections.testing', ['driver' => 'sqlite', 'database' => ':memory:', 'prefix' => '']);
         $app['config']->set('queue.default', 'sync');
+        $app['config']->set('monitor-track.long_running_commands', 'reports:daemon, distribution:*');
     }
 
     protected function defineRoutes($router): void
@@ -196,6 +200,48 @@ class QueryListenerTest extends TestCase
         $this->assertSame('app/Services/CustomerLookup.php', $events[0]['query']['frames'][0]['file']);
     }
 
+    public function test_a_configured_long_running_command_is_not_a_scope_and_sends_as_it_runs(): void
+    {
+        $kernel = $this->app->make(Kernel::class);
+        if (method_exists($kernel, 'rerouteSymfonyCommandEvents')) {
+            $kernel->rerouteSymfonyCommandEvents();
+            $kernel->setArtisan(null);
+        }
+        $kernel->registerCommand(new DistributionSupervisor);
+
+        $posts = [];
+        $http = new HttpTransport('http://ingest.test', 'tok', 1000, new Stats, 500, 1000,
+            function (string $url, array $headers, string $body) use (&$posts) {
+                $posts[] = array_map(fn ($l) => json_decode($l, true), explode("\n", rtrim((string) gzdecode($body))));
+
+                return ['status' => 202, 'retryable' => false];
+            });
+        $this->client()->setTransport($http);
+        DistributionSupervisor::$between = function () use ($http) {
+            $property = new \ReflectionProperty(HttpTransport::class, 'lastFlush');
+            if (PHP_VERSION_ID < 80100) {
+                $property->setAccessible(true); // a no-op since 8.1, deprecated in 8.5
+            }
+            $property->setValue($http, microtime(true) - 2.1);
+        };
+
+        try {
+            $this->artisan('distribution:supervisor')->assertExitCode(0);
+        } finally {
+            DistributionSupervisor::$between = null;
+        }
+
+        // Sent while the command ran: the two loop logs, not yet its job.
+        $this->assertCount(1, $posts);
+        $this->assertSame(['supervisor loop 1', 'supervisor loop 2'], array_column($posts[0], 'message'));
+        $this->client()->flush();
+
+        // 24 repeated statements in the command itself: not an N+1; its job is.
+        $queries = array_values(array_filter(array_merge(...$posts), fn ($e) => $e['type'] === 'query'));
+        $this->assertCount(1, $queries);
+        $this->assertSame(['job', SyncStock::class, 12], [$queries[0]['query']['scope'], $queries[0]['query']['scope_name'], $queries[0]['query']['count']]);
+    }
+
     public function test_n_plus_one_in_a_scheduled_callback(): void
     {
         $memory = $this->fake();
@@ -247,8 +293,10 @@ class QueryListenerTest extends TestCase
     {
         $memory = $this->fake();
 
-        event(new CommandStarting('horizon:work', new ArrayInput([]), new NullOutput));
-        (new CustomerLookup)->names(range(1, 12));
+        foreach (['horizon:work', 'reports:daemon', 'distribution:start'] as $command) {
+            event(new CommandStarting($command, new ArrayInput([]), new NullOutput));
+            (new CustomerLookup)->names(range(1, 12));
+        }
         $this->app->terminate();
 
         $this->assertSame([], $memory->events('query'));

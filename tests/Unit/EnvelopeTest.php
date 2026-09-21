@@ -259,6 +259,16 @@ class EnvelopeTest extends TestCase
         $this->assertSame([500.0, 0], [$o['slow_query_ms'], $o['n_plus_one']]);
     }
 
+    public function test_long_running_commands_from_env_or_config(): void
+    {
+        $this->assertSame([], Client::normalizeOptions([])['long_running_commands']);
+        $this->assertSame([], Client::normalizeOptions(['long_running_commands' => ''])['long_running_commands']);
+        $this->assertSame(['distribution:*', 'reports:daemon'],
+            Client::normalizeOptions(['long_running_commands' => ' distribution:* ,, reports:daemon '])['long_running_commands']);
+        $this->assertSame(['distribution:*'],
+            (new Client(['long_running_commands' => ['distribution:*', '']]))->longRunningCommands());
+    }
+
     public function test_disabled_client_is_a_no_op(): void
     {
         $memory = new MemoryTransport;

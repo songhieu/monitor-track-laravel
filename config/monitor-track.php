@@ -51,6 +51,11 @@ return [
     // seconds on one server (a marker file in the temp dir). 0 = every one.
     'query_throttle_seconds' => env('MT_QUERY_THROTTLE_SECONDS', 60),
 
+    // Your own artisan commands that run for as long as the process (daemon
+    // loops), comma-separated names or patterns: "distribution:*". Like
+    // queue:work, they are not a query scope themselves; their jobs are.
+    'long_running_commands' => env('MT_LONG_RUNNING_COMMANDS'),
+
     // Automatic integrations.
     'capture' => [
         'exceptions' => true,   // ExceptionHandler::reportable()

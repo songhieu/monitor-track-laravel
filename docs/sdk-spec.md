@@ -204,8 +204,8 @@ Idempotency-Key: 5f0c2a7e9b1d4c33 (optional, random per batch)
 | 202 | accepted |
 | 401 | bad token — drop batch |
 | 413 | too large — drop batch |
-| 429 | rate limited — drop batch |
-| 503 | backend busy — drop batch |
+| 429 | rate limited — drop batch (Laravel: and back off) |
+| 503 | backend busy — drop batch (Laravel: and back off) |
 | other / timeout | drop batch |
 | connection refused/reset before a response | one quick retry (≈200 ms later, same `Idempotency-Key`), then drop |
 
@@ -220,8 +220,30 @@ SDK behaviour:
 - Timeout **2 s** per request (Laravel: 0.5 s connect, 1 s total). No retry
   loops, no backoff queues: a failed batch is dropped and counted.
 - Laravel (no threads) buffers during the request and sends once from
-  `app()->terminating()` (after the response under FPM); queue workers flush
-  from the `Looping` event every 2 s / 500 events.
+  `app()->terminating()` (after the response under FPM, and when an artisan
+  command ends). A console process also flushes when due (2 s / 500 events)
+  each time it records an event, so a daemon command without a worker loop
+  delivers as it runs; this stops once the process shows it is a queue worker
+  (`Looping`, or a job from a queue other than sync), so a job never waits
+  for the network. Queue workers flush from the `Looping` event every 2 s / 500
+  events and at `WorkerStopping`; Horizon's master and supervisor processes
+  flush from their once-a-second loop (`MasterSupervisorLooped`,
+  `SupervisorLooped`) under the same 2 s / 500 rule.
+- Laravel under Octane (one process serves many requests, detected by the
+  `LARAVEL_OCTANE` variable Octane sets for its server, outside the console):
+  after a request the buffer is sent only when due (2 s since the last send or
+  500 events), never once per request. In a Swoole HTTP worker a one-shot
+  timer sends what is left about 2 s later, between requests. Task workers
+  flush when due after `TaskTerminated` / `TickTerminated`. `WorkerStopping`
+  (max requests reached, `octane:reload`) sends everything; a shutdown
+  function is the last resort. Octane stops Swoole with `SIGKILL`, so at most
+  the last ~2 s of events of a worker can be lost on `octane:stop`.
+  Octane classes are listened to by name; Octane is not a dependency.
+- Laravel backoff: after a batch gets no response, 429 or 502–504, a
+  long-running process skips scheduled flushes for 5 s, doubling up to 60 s
+  and reset by the next accepted batch. Events keep being buffered (bounded,
+  newest dropped); a `flush()` during the pause drops the buffer at once
+  instead of waiting for another timeout.
 - `flush(timeout)` / `close(timeout)` send what is queued and return by the
   deadline even if the server hangs. Python registers an `atexit` flush.
 
@@ -246,6 +268,7 @@ Same environment variables in every SDK (options passed in code win):
 | `MT_SLOW_QUERY_MS` | `500` | (Laravel) report queries at least this slow; `0` = off |
 | `MT_N_PLUS_ONE` | `10` | (Laravel) report a statement run this many times in one scope (minimum 2); `0` = off |
 | `MT_QUERY_THROTTLE_SECONDS` | `60` | (Laravel) at most one query event per statement and call site per window per server; `0` = no throttle |
+| `MT_LONG_RUNNING_COMMANDS` | — | (Laravel) comma-separated artisan command names or `*` patterns that are long-running like `queue:work` (section 10) |
 
 `MT_TRANSPORT=http` without `MT_ENDPOINT` falls back to `stream`.
 
@@ -307,6 +330,9 @@ skipped by sampling), `errors` (swallowed internal errors).
 - Heartbeats describe the worker: queues, `busy`/`idle`, current job and when
   it started, memory, processed count. The worker status page shows one row per
   `(app, host, pid)` with its last heartbeat.
+- Heartbeats come only from queue worker processes (Laravel: a process that
+  has seen the worker's `Looping` event). A job run synchronously in a web
+  request or an Octane worker sends `job` events but no heartbeat.
 - A worker with no heartbeat for 3 × interval (45 s by default) is
   considered gone; its in-flight runs are marked **lost** (typically OOMKilled
   or evicted pods). Exception: single-threaded workers (PHP) cannot send
@@ -337,7 +363,7 @@ Queries are counted per unit of work, and its findings are sent when it ends:
 
 | scope | starts | ends | `scope_name` |
 |---|---|---|---|
-| `request` | the process (Octane: `RequestReceived`) | the app's terminating callbacks, after the response under FPM | route template, `GET /orders/{order}`; `GET (no route)` when none matched |
+| `request` | the process (Octane: `RequestReceived`, and in task workers `TaskReceived` / `TickReceived`) | the app's terminating callbacks, after the response under FPM | route template, `GET /orders/{order}`; `GET (no route)` when none matched |
 | `job` | `JobProcessing` | the first of `JobProcessed`, `JobFailed`, `JobExceptionOccurred`, `JobReleasedAfterException`, `JobTimedOut` | job class |
 | `command` | `CommandStarting` | `CommandFinished` | `artisan {command}` |
 | `schedule` | `ScheduledTaskStarting` (in-process tasks) | `ScheduledTaskFinished` / `ScheduledTaskFailed` | task name (section 7) |
@@ -346,13 +372,17 @@ Queries are counted per unit of work, and its findings are sent when it ends:
   open one. A scope still open on terminating ends there.
 - Long-running commands are not scopes: `queue:work`, `queue:listen`,
   `horizon`, `horizon:work`, `horizon:supervisor`, `schedule:work`,
-  `octane:*`, `reverb:start`, `pulse:check`, `pulse:work`. Their jobs are.
+  `octane:*`, `reverb:start`, `pulse:check`, `pulse:work`, and the names or
+  `*` patterns in `MT_LONG_RUNNING_COMMANDS`. Their jobs are.
   Queries a worker makes between jobs (polling the database queue) are not
   counted; a queue worker is also recognized by its `Looping` event.
 - Queries outside any scope are evaluated on terminating as `request` (when
   a route matched) or `command` (`artisan {command}` from argv).
 - Every scope starts with empty counters, so a worker or an Octane process
-  carries nothing from one job or request to the next.
+  carries nothing from one job or request to the next. Under Octane each
+  request runs in its own clone of the application; the route, user and
+  trace id are read from the current container when an event is built, never
+  from the application the SDK booted with.
 
 ### Normalization
 

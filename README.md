@@ -79,6 +79,7 @@ These `MT_*` variables are the same in the Go and Python SDKs.
 | `MT_SLOW_QUERY_MS` | `500` | report queries at least this slow; `0` turns it off |
 | `MT_N_PLUS_ONE` | `10` | report a statement run this many times in one request / job / command (minimum 2); `0` turns it off |
 | `MT_QUERY_THROTTLE_SECONDS` | `60` | at most one query event per statement and call site per window per server; `0` sends every one |
+| `MT_LONG_RUNNING_COMMANDS` | — | your own daemon commands, comma-separated names or patterns (`distribution:*`): not a query scope themselves, like `queue:work` |
 
 With `MT_TRANSPORT=http` and no `MT_ENDPOINT`, the SDK falls back to `stream`.
 `config/monitor-track.php` also has `capture.exceptions|queue|schedule|queries`
@@ -90,7 +91,7 @@ switches and the http timeouts.
 |---|---|
 | `ExceptionHandler::reportable()` | `exception` with frames (innermost first, relative to `base_path()`, `in_app` = not `vendor/`), route `POST /api/v1/payments/{payment}`, user id (only when the guard already loaded the user, so no extra query), trace id from `traceparent` or `X-Request-Id`. Exceptions in `$dontReport` (404, validation, …) are skipped as usual. |
 | Queue worker (`JobProcessing`, `JobProcessed`, `JobFailed`, `JobExceptionOccurred`, `JobReleasedAfterException`, `JobTimedOut`) | `job` `start`, then exactly one of `done` / `failed` / `retry` per attempt, with queue, connection, class, uuid, attempts, `runtime_ms`, `timeout_ms` |
-| Queue worker `Looping` | `heartbeat` every `MT_HEARTBEAT_SECONDS`: queues, busy/idle, current job, memory, processed count |
+| Queue worker `Looping` | `heartbeat` every `MT_HEARTBEAT_SECONDS`: queues, busy/idle, current job, memory, processed count. Only queue workers (`queue:work`, `horizon:work`) send heartbeats; a `dispatch_sync()` job in a web request or an Octane worker is a job run, not a worker. |
 | Scheduler (`ScheduledTaskStarting`, `Finished`, `Failed`, `Skipped`, `ScheduledBackgroundTaskFinished`) | `cron` `start` / `success` / `fail` / `skip` with name, expression, timezone, exit code, duration and the output tail on failure. The first event registers the task in monitor-track with its schedule. |
 | Database (`QueryExecuted`) | `query` `n_plus_one` / `slow` per request, job, command or scheduled task, with the normalized SQL, count, total and max time, and the call site. See [Slow queries and N+1](#slow-queries-and-n1). |
 
@@ -129,7 +130,10 @@ request, and when the job, command or scheduled task finishes. A queue
 worker (`queue:work`, Horizon) and the other long-running commands
 (`schedule:work`, `octane:*`, `reverb:start`, `pulse:*`) are not a unit
 themselves. Each job they run is one, and the worker's own polling queries
-are ignored. Counters start empty for every job and request, so nothing
+are ignored. Add your own daemon commands to that list with
+`MT_LONG_RUNNING_COMMANDS=distribution:*,reports:daemon` (names or `*`
+patterns); otherwise a command that loops for hours is one unit, and a
+statement it repeats over its lifetime is reported as N+1 when it exits. Counters start empty for every job and request, so nothing
 builds up in a long-running worker or an Octane process.
 
 **Events are samples.** The SDK sends at most one event per statement and
@@ -207,6 +211,7 @@ MonitorTrack::trackCron('reports:nightly', '0 2 * * *', fn () => $reports->build
 
 MonitorTrack::stats();   // ['emitted' => …, 'dropped' => …, 'sampled' => …, 'errors' => …]
 MonitorTrack::flush();   // http transport: send the buffer now (2 s budget)
+MonitorTrack::flushIfDue(); // http transport: send if 2 s passed or 500 events wait (daemon loops)
 ```
 
 `trackJob` and `trackCron` record the exception and rethrow it unchanged.
@@ -238,11 +243,50 @@ $this->assertCount(1, $events->events('exception'));
 - **http**: events are buffered in memory (at most `MT_QUEUE_SIZE`, the newest
   are dropped when full). They are sent as gzip NDJSON to
   `{MT_ENDPOINT}/api/v1/logs/ingest` from `app()->terminating()`, which runs
-  after the response is sent under FPM. Long-running queue workers send every
-  2 s or 500 events from the `Looping` event, and at `WorkerStopping`. A
-  shutdown function is the last resort. Each request has a 0.5 s connect
-  timeout and a 1 s total timeout. A connection error gets one retry after
-  200 ms. Any non-2xx response drops the batch.
+  after the response is sent under FPM and when an artisan command ends. A
+  console process also sends when due (2 s or 500 events) as it records
+  events, so a daemon command delivers while it runs. Queue workers instead
+  send every 2 s or 500 events from the `Looping` event, between jobs, and at
+  `WorkerStopping`; Horizon's master and supervisor processes send from their
+  once-a-second loop. Octane workers send when due, see
+  [Laravel Octane](#laravel-octane). A shutdown function is the last resort.
+  Each request has a 0.5 s connect timeout and a 1 s total timeout. A
+  connection error gets one retry after 200 ms. Any non-2xx response drops
+  the batch. When the ingest can't be reached or answers 429 / 502–504, a
+  long-running process stops trying for 5 s, doubling up to 60 s: events keep
+  being buffered (up to `MT_QUEUE_SIZE`) and go out when it is back.
+
+## Laravel Octane
+
+The SDK works under Octane (Swoole, RoadRunner) without configuration:
+
+- **Per-request context.** Octane serves every request from a fresh clone of
+  the booted application. The SDK reads the route, user and trace id from the
+  current container at the time of each event, so every event carries its
+  own request's `route`, `user_id` and `trace_id`, and exceptions are reported
+  from every request, whichever copy of the exception handler it resolves.
+- **Queries.** N+1 and slow-query counters start empty for every request
+  (and every Octane task and tick), so nothing adds up across requests.
+- **http transport.** An Octane worker serves many requests, so it does not
+  POST after each one. After a request, the buffer is sent when it is due:
+  2 s since the last send, or 500 events. On Swoole, a one-shot timer sends
+  what is left about 2 s after the last request; it fires between requests,
+  never during one. Task workers send after their tasks and ticks, and every
+  worker sends everything at `WorkerStopping` (max requests reached,
+  `octane:reload`). A worker is detected by the `LARAVEL_OCTANE` variable
+  Octane sets for its server.
+
+Octane (1.x and 2.x) stops Swoole with `SIGKILL` (`octane:stop`, or
+`SIGTERM` to `octane:start`, which is what supervisord and Kubernetes send),
+so no PHP code runs at that point: up to the last ~2 s of events of each
+worker can be lost when the server is stopped. The same goes for a worker
+killed for exceeding Octane's `max_execution_time`. With RoadRunner there is no timer: what a
+request leaves in the buffer goes with a later request or when the worker
+stops.
+
+With the stream transport, worker output passes through `octane:start`,
+which re-encodes JSON lines before printing them. Prefer the http or file
+transport under Octane.
 
 ## Why this never slows your app
 
@@ -258,6 +302,8 @@ $this->assertCount(1, $events->events('exception'));
   most 5 levels deep and 100 items per level.
 - **Bounded time.** Each http request has a 0.5 s connect and 1 s total
   timeout, with one quick retry and no loops. `flush()` stops at its budget.
+  After a failed send, long-running processes (queue workers, Octane) back
+  off for 5–60 s instead of waiting for the timeout at every flush.
 - **Bounded size.** Lines stay under 16 KiB where possible and never exceed
   32 KiB. The message, output and context are truncated first, and the event
   is dropped only as a last resort. Output is always a single line.
@@ -279,7 +325,13 @@ $this->assertCount(1, $events->events('exception'));
   go quiet until they finish.
 - `runInBackground()` tasks report success or failure from the
   `schedule:finish` process. That process doesn't know the start time, so
-  these events carry no `duration_ms`.
+  these events carry no `duration_ms`. Laravel sends the output of that
+  process to `/dev/null` (and the task's own output to `/dev/null` or its
+  `appendOutputTo()` file), so with the stream transport these events are
+  lost: use the http or file transport for a scheduler with background tasks.
+- A daemon command that records no events for a while holds what it buffered
+  until its next event or its exit: the check runs when an event is recorded.
+  Call `MonitorTrack::flushIfDue()` in its loop if that matters.
 - N+1 counts runs of the same statement per request or job, wherever they
   come from. The call site reported is the one of the run that reached the
   threshold.

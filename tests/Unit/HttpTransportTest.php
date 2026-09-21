@@ -238,6 +238,83 @@ class HttpTransportTest extends TestCase
         $this->assertSame(500, $posted, '500 buffered events trigger a flush');
     }
 
+    public function test_an_unreachable_ingest_is_backed_off_instead_of_stalling_every_flush(): void
+    {
+        $calls = 0;
+        $status = 0;
+        $stats = new Stats;
+        $transport = new HttpTransport('http://x', 't', 1000, $stats, 500, 1000,
+            function () use (&$calls, &$status) {
+                $calls++;
+
+                return ['status' => $status, 'retryable' => false];
+            });
+        $client = new Client([], $transport, $stats);
+
+        for ($i = 0; $i < 600; $i++) {
+            $client->log('info', "e{$i}");
+        }
+        $client->flushIfDue();
+        $this->assertSame(1, $calls, 'the second batch is not tried against a dead ingest');
+        $this->assertSame(500, $client->stats()['dropped']);
+        $this->assertSame(100, $transport->pending());
+
+        // Scheduled flushes keep buffering while backing off (bounded).
+        for ($i = 0; $i < 400; $i++) {
+            $client->log('info', "f{$i}");
+        }
+        $client->flushIfDue();
+        $this->assertSame(1, $calls);
+        $this->assertSame(500, $transport->pending());
+
+        // The backoff is over and the ingest is back.
+        $status = 202;
+        $this->setPrivate($transport, 'retryAt', 0.0);
+        $client->flushIfDue();
+        $this->assertSame(2, $calls);
+        $this->assertSame(0, $transport->pending());
+        $this->assertSame(500, $client->stats()['dropped']);
+
+        // An explicit flush right after a failure gives up at once.
+        $status = 0;
+        $client->log('info', 'g');
+        $client->flush();
+        $client->log('info', 'h');
+        $client->flush();
+        $this->assertSame(3, $calls);
+        $this->assertSame(502, $client->stats()['dropped']);
+        $this->assertSame(0, $transport->pending());
+    }
+
+    public function test_only_unavailable_answers_back_off(): void
+    {
+        foreach ([429 => 1, 503 => 1, 500 => 2, 413 => 2] as $status => $expectedCalls) {
+            $calls = 0;
+            $transport = new HttpTransport('http://x', 't', 1000, new Stats, 500, 1000,
+                function () use (&$calls, $status) {
+                    $calls++;
+
+                    return ['status' => $status, 'retryable' => false];
+                });
+            $client = new Client([], $transport);
+            for ($i = 0; $i < 600; $i++) {
+                $client->log('info', "e{$i}");
+            }
+            $client->flush();
+
+            $this->assertSame($expectedCalls, $calls, "status {$status}");
+        }
+    }
+
+    private function setPrivate(object $object, string $name, mixed $value): void
+    {
+        $property = new \ReflectionProperty($object, $name);
+        if (PHP_VERSION_ID < 80100) {
+            $property->setAccessible(true); // a no-op since 8.1, deprecated in 8.5
+        }
+        $property->setValue($object, $value);
+    }
+
     public function test_sender_exceptions_are_swallowed(): void
     {
         $stats = new Stats;

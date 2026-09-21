@@ -5,7 +5,9 @@ namespace MonitorTrack\Tests\Feature;
 use Illuminate\Support\Facades\Log;
 use MonitorTrack\Facades\MonitorTrack;
 use MonitorTrack\Monolog\Handler;
+use MonitorTrack\Stats;
 use MonitorTrack\Tests\TestCase;
+use MonitorTrack\Transport\HttpTransport;
 use MonitorTrack\Transport\StreamTransport;
 use Monolog\Level;
 use Monolog\Logger;
@@ -133,6 +135,76 @@ class ServiceProviderTest extends TestCase
         $this->client()->log('info', 'after login');
 
         $this->assertSame('1823', $memory->events('log')[0]['user_id']);
+    }
+
+    /**
+     * @param  list<int>  $posts  number of lines of each POST
+     */
+    private function httpTransport(array &$posts): HttpTransport
+    {
+        $http = new HttpTransport('http://ingest.test', 'tok', 1000, new Stats, 500, 1000,
+            function (string $url, array $headers, string $body) use (&$posts) {
+                $posts[] = substr_count((string) gzdecode($body), "\n");
+
+                return ['status' => 202, 'retryable' => false];
+            });
+        $this->client()->setTransport($http);
+
+        return $http;
+    }
+
+    public function test_http_buffer_is_sent_after_every_request_outside_octane(): void
+    {
+        $posts = [];
+        $this->httpTransport($posts);
+
+        $this->post('/api/v1/payments/1')->assertStatus(500);
+        $this->post('/api/v1/payments/2')->assertStatus(500);
+
+        $this->assertSame([1, 1], $posts, 'FPM: one POST per request, after the response');
+    }
+
+    public function test_console_processes_send_when_due_as_events_are_recorded_until_a_worker_loop_starts(): void
+    {
+        $posts = [];
+        $http = $this->httpTransport($posts);
+        $age = function () use ($http) {
+            $property = new \ReflectionProperty(HttpTransport::class, 'lastFlush');
+            if (PHP_VERSION_ID < 80100) {
+                $property->setAccessible(true); // a no-op since 8.1, deprecated in 8.5
+            }
+            $property->setValue($http, microtime(true) - 2.1);
+        };
+
+        $this->client()->log('info', 'a');
+        $this->assertSame([], $posts, 'not due');
+        $age();
+        $this->client()->log('info', 'b');
+        $this->assertSame([2], $posts, 'due: sent while the command runs');
+
+        // A queue worker sends between jobs (Looping), never from inside one.
+        event(new \Illuminate\Queue\Events\Looping('redis', 'default'));
+        $age();
+        $this->client()->log('info', 'c');
+        $this->assertSame([2], $posts);
+    }
+
+    public function test_horizon_supervisor_loops_send_when_due(): void
+    {
+        $posts = [];
+        $http = $this->httpTransport($posts);
+        $this->client()->log('warning', 'redis reconnected');
+
+        event('Laravel\Horizon\Events\SupervisorLooped');
+        $this->assertSame([], $posts, 'not due');
+
+        $property = new \ReflectionProperty(HttpTransport::class, 'lastFlush');
+        if (PHP_VERSION_ID < 80100) {
+            $property->setAccessible(true); // a no-op since 8.1, deprecated in 8.5
+        }
+        $property->setValue($http, microtime(true) - 2.1);
+        event('Laravel\Horizon\Events\MasterSupervisorLooped');
+        $this->assertSame([1], $posts);
     }
 
     public function test_mt_test_command_emits_one_of_each_type(): void

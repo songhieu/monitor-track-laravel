@@ -2,16 +2,23 @@
 
 namespace MonitorTrack\Support;
 
-use Illuminate\Contracts\Foundation\Application;
+use Illuminate\Container\Container;
 
 /**
  * Reads trace id, user id and route from the current request without causing
  * side effects: nothing is resolved from the container that wasn't already,
  * and the user is only read when the guard has already loaded it (no query).
+ *
+ * The container is looked up on every call. Octane serves each request from
+ * its own clone of the application (Container::getInstance() while the
+ * request runs), so the application the SDK booted with is not the request's.
  */
 final class RequestScope
 {
-    public function __construct(private Application $app)
+    /**
+     * @param  Container|null  $container  a fixed container; null = the current one
+     */
+    public function __construct(private ?Container $container = null)
     {
     }
 
@@ -23,8 +30,14 @@ final class RequestScope
         $out = [];
 
         try {
-            if ($this->app->resolved('request')) {
-                $request = $this->app->make('request');
+            $app = $this->container ?? Container::getInstance();
+        } catch (\Throwable) {
+            return $out;
+        }
+
+        try {
+            if ($app->resolved('request')) {
+                $request = $app->make('request');
 
                 $trace = self::traceId(
                     (string) $request->headers->get('traceparent', ''),
@@ -44,8 +57,8 @@ final class RequestScope
         }
 
         try {
-            if ($this->app->resolved('auth')) {
-                $auth = $this->app->make('auth');
+            if ($app->resolved('auth')) {
+                $auth = $app->make('auth');
                 if (! method_exists($auth, 'hasResolvedGuards') || $auth->hasResolvedGuards()) {
                     $guard = $auth->guard();
                     if (method_exists($guard, 'hasUser') && $guard->hasUser()) {

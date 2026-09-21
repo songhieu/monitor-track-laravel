@@ -45,7 +45,13 @@ class Client
 
     private int $queryThrottleSeconds;
 
+    /** @var list<string> command names / patterns (`distribution:*`) that run for as long as the process */
+    private array $longRunningCommands;
+
     private string $basePath;
+
+    /** Send when due (2 s / 500 events) each time an event is recorded. */
+    private bool $flushOnRecord = false;
 
     /** @var (callable(): array<string, string>)|null */
     private $scopeResolver = null;
@@ -72,6 +78,7 @@ class Client
         $this->slowQueryMs = $o['slow_query_ms'];
         $this->nPlusOne = $o['n_plus_one'];
         $this->queryThrottleSeconds = $o['query_throttle_seconds'];
+        $this->longRunningCommands = $o['long_running_commands'];
         $this->basePath = $o['base_path'];
         $this->base = [
             'app' => $o['app'],
@@ -103,7 +110,7 @@ class Client
      * @return array{enabled:bool, transport:string, stream:string, file:string, endpoint:string, token:string,
      *     app:string, env:string, release:string, host:string, sample_rate:float, queue_size:int,
      *     heartbeat_seconds:int, slow_query_ms:float, n_plus_one:int, query_throttle_seconds:int,
-     *     base_path:string, http_connect_timeout_ms:int, http_timeout_ms:int}
+     *     long_running_commands:list<string>, base_path:string, http_connect_timeout_ms:int, http_timeout_ms:int}
      */
     public static function normalizeOptions(array $raw): array
     {
@@ -152,6 +159,11 @@ class Client
         $nPlusOne = (int) $threshold($raw['n_plus_one'] ?? null, 10.0);
         $nPlusOne = $nPlusOne > 0 ? max(2, $nPlusOne) : 0;
 
+        // "distribution:*, reports:daemon" (env) or a list (config).
+        $longRunning = $raw['long_running_commands'] ?? [];
+        $longRunning = is_array($longRunning) ? $longRunning : explode(',', $str($longRunning));
+        $longRunning = array_values(array_filter(array_map($str, $longRunning), static fn ($v) => $v !== ''));
+
         $host = $str($raw['host'] ?? '');
         if ($host === '') {
             $host = (string) (@gethostname() ?: '');
@@ -174,6 +186,7 @@ class Client
             'slow_query_ms' => $threshold($raw['slow_query_ms'] ?? null, 500.0),
             'n_plus_one' => $nPlusOne,
             'query_throttle_seconds' => (int) $threshold($raw['query_throttle_seconds'] ?? null, 60.0),
+            'long_running_commands' => $longRunning,
             'base_path' => rtrim($str($raw['base_path'] ?? ''), '/\\'),
             'http_connect_timeout_ms' => (int) ($raw['http_connect_timeout_ms'] ?? 500),
             'http_timeout_ms' => (int) ($raw['http_timeout_ms'] ?? 1000),
@@ -263,6 +276,28 @@ class Client
     public function queryThrottleSeconds(): int
     {
         return $this->queryThrottleSeconds;
+    }
+
+    /**
+     * MT_LONG_RUNNING_COMMANDS: artisan commands (names or `*` patterns) that
+     * are not a query scope themselves, like queue:work.
+     *
+     * @return list<string>
+     */
+    public function longRunningCommands(): array
+    {
+        return $this->longRunningCommands;
+    }
+
+    /**
+     * Send the buffer when due (2 s / 500 events) each time an event is
+     * recorded. The service provider turns it on in console processes, so a
+     * long-running command without a worker loop sends as it goes; queue
+     * workers turn it off (they send between jobs), Octane never has it.
+     */
+    public function setFlushOnRecord(bool $on): void
+    {
+        $this->flushOnRecord = $on;
     }
 
     /**
@@ -645,6 +680,10 @@ class Client
                 $this->stats->emitted++;
             } else {
                 $this->stats->dropped++;
+            }
+
+            if ($this->flushOnRecord) {
+                $this->transport->flushIfDue();
             }
         } catch (\Throwable) {
             $this->stats->errors++;

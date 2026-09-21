@@ -16,6 +16,7 @@ use MonitorTrack\Client;
  * @method static mixed trackCron(string $name, ?string $expr, callable $fn, ?string $tz = null)
  * @method static void record(string $type, string $level, string $message, array $fields = [])
  * @method static void flush(float $timeout = 2.0)
+ * @method static void flushIfDue()
  * @method static array stats()
  * @method static bool isEnabled()
  * @method static \MonitorTrack\Transport\MemoryTransport fake()

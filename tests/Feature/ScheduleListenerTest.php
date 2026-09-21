@@ -2,6 +2,7 @@
 
 namespace MonitorTrack\Tests\Feature;
 
+use Illuminate\Console\Events\ScheduledBackgroundTaskFinished;
 use Illuminate\Console\Events\ScheduledTaskFailed;
 use Illuminate\Console\Events\ScheduledTaskFinished;
 use Illuminate\Console\Events\ScheduledTaskSkipped;
@@ -10,7 +11,9 @@ use Illuminate\Console\Scheduling\CallbackEvent;
 use Illuminate\Console\Scheduling\Event;
 use Illuminate\Console\Scheduling\EventMutex;
 use MonitorTrack\Listeners\ScheduleListener;
+use MonitorTrack\Stats;
 use MonitorTrack\Tests\TestCase;
+use MonitorTrack\Transport\HttpTransport;
 
 class ScheduleListenerTest extends TestCase
 {
@@ -110,6 +113,57 @@ class ScheduleListenerTest extends TestCase
         $this->assertMatchesRegularExpression('/^closure:ScheduleListenerTest\.php:\d+$/', ScheduleListener::name($closure));
         $timezone = $this->task('php artisan x', '* * * * *', new \DateTimeZone('Europe/Berlin'));
         $this->assertSame('Europe/Berlin', (new ScheduleListener($this->client()))->describe($timezone)['tz']);
+    }
+
+    public function test_background_task_finishes_from_schedule_finish_with_its_exit_code(): void
+    {
+        $memory = $this->fake();
+
+        foreach ([3, 0] as $exit) {
+            // schedule:run starts the task in the background and moves on.
+            $task = $this->task()->runInBackground()->withoutOverlapping();
+            event(new ScheduledTaskStarting($task));
+            event(new ScheduledTaskFinished($task, 0.02));
+
+            // The `schedule:finish {mutex} {exit}` process: the same task
+            // definition, a new object; Event::finish() set the exit code.
+            $finished = $this->task()->runInBackground()->withoutOverlapping();
+            $finished->exitCode = $exit;
+            event(new ScheduledBackgroundTaskFinished($finished));
+        }
+
+        $events = $memory->events('cron');
+        $this->assertSame(['start', 'fail', 'start', 'success'], array_column(array_column($events, 'cron'), 'phase'));
+        $this->assertSame(3, $events[1]['cron']['exit_code']);
+        $this->assertSame('Scheduled task failed: invoices:send-reminders (exit 3)', $events[1]['message']);
+        $this->assertArrayNotHasKey('duration_ms', $events[1]['cron'], 'the start time is in another process');
+        $this->assertSame(0, $events[3]['cron']['exit_code']);
+        foreach ($events as $event) {
+            $this->assertSame(['invoices:send-reminders', '0 9 * * 1-5', 'Asia/Ho_Chi_Minh'],
+                [$event['cron']['name'], $event['cron']['expr'], $event['cron']['tz']]);
+        }
+    }
+
+    public function test_http_buffer_leaves_when_the_artisan_process_terminates(): void
+    {
+        // schedule:run and schedule:finish are artisan commands: artisan
+        // calls the kernel's terminate(), which runs the terminating callbacks.
+        $posts = [];
+        $this->client()->setTransport(new HttpTransport('http://ingest.test', 'tok', 1000, new Stats, 500, 1000,
+            function (string $url, array $headers, string $body) use (&$posts) {
+                $posts[] = array_column(array_map(fn ($l) => json_decode($l, true)['cron'], explode("\n", rtrim((string) gzdecode($body)))), 'phase');
+
+                return ['status' => 202, 'retryable' => false];
+            }));
+
+        $task = $this->task();
+        event(new ScheduledTaskStarting($task));
+        event(new ScheduledTaskSkipped($this->task('php artisan reports:build')));
+        $this->assertSame([], $posts);
+
+        $this->app->terminate();
+
+        $this->assertSame([['start', 'skip']], $posts);
     }
 
     public function test_output_tail_is_attached_to_failures(): void
