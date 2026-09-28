@@ -464,7 +464,7 @@ class Client
      * A scheduled task phase (type=cron).
      *
      * @param  string  $phase  start | success | fail | skip
-     * @param  array{name?:string, expr?:string, tz?:string, exit_code?:int|null, duration_ms?:int|null, output?:string|null}  $cron
+     * @param  array{name?:string, expr?:string, tz?:string, scheduled?:int|null, exit_code?:int|null, duration_ms?:int|null, output?:string|null}  $cron
      * @param  array<array-key, mixed>  $context
      */
     public function cron(string $phase, array $cron, array $context = []): void
@@ -492,12 +492,50 @@ class Client
             'expr' => $cron['expr'] ?? null,
             'tz' => $cron['tz'] ?? null,
             'phase' => $phase,
+            // The slot (unix seconds) the scheduler ran the task for.
+            'scheduled' => ! $finish && isset($cron['scheduled']) ? (int) $cron['scheduled'] : null,
             'exit_code' => $exit,
             'duration_ms' => $duration,
             'output' => $phase === 'fail' ? ($cron['output'] ?? null) : null,
         ];
 
         $this->record('cron', $level, $message, ['context' => $context, 'cron' => $payload]);
+    }
+
+    /** Encoded bytes of tasks per `list` event, well under the 16 KiB line target. */
+    private const CRON_LIST_CHUNK_BYTES = 8192;
+
+    /**
+     * The scheduled tasks as the scheduler sees them (type=cron,
+     * phase=list), so the backend can tell a task that was renamed or
+     * removed from one that did not run. A long schedule is sent as several
+     * events; each simply lists its share.
+     *
+     * @param  list<array{name:string, expr:string, tz:string}>  $tasks
+     */
+    public function cronList(array $tasks): void
+    {
+        if (! $this->enabled || $tasks === []) {
+            return;
+        }
+
+        $chunks = [[]];
+        $size = 0;
+        foreach ($tasks as $task) {
+            $n = strlen((string) json_encode($task, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE)) + 1;
+            if ($size > 0 && $size + $n > self::CRON_LIST_CHUNK_BYTES) {
+                $chunks[] = [];
+                $size = 0;
+            }
+            $chunks[array_key_last($chunks)][] = $task;
+            $size += $n;
+        }
+
+        $total = count($tasks);
+        foreach ($chunks as $i => $chunk) {
+            $part = count($chunks) > 1 ? ' ('.($i + 1).'/'.count($chunks).')' : '';
+            $this->record('cron', 'debug', "Schedule listed: {$total} tasks{$part}", ['cron' => ['phase' => 'list', 'tasks' => $chunk]]);
+        }
     }
 
     /**

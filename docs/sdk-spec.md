@@ -101,10 +101,21 @@ handler; Go/Python helpers send it themselves).
 | `success` | info | `Scheduled task succeeded: {name} ({duration_ms}ms)` | `exit_code` 0, `duration_ms` |
 | `fail` | error | `Scheduled task failed: {name} (exit {exit_code}, {duration_ms}ms)` | `exit_code` (default 1), `duration_ms`, optional `output` |
 | `skip` | info | `Scheduled task skipped: {name}` | — |
+| `list` | debug | `Schedule listed: {n} tasks` (` ({i}/{parts})` when split) | `tasks`, no `name` |
 
 SDKs send `expr` (5-field cron, or 6 with seconds) and `tz` (IANA) on every
 event when they know them. `output` keeps the **tail** (last bytes) of the
-output / error text.
+output / error text. `start`/`skip` may carry `scheduled`: the slot the
+scheduler ran the task for, as unix seconds (Laravel: the minute its
+`schedule:run` started; not sent for sub-minute tasks).
+
+`list` is the whole schedule, so the backend can tell a task that was
+renamed or removed from one that did not run (section 7):
+```json
+"cron":{"phase":"list","tasks":[{"name":"invoices:send-reminders","expr":"0 9 * * 1-5","tz":"Asia/Ho_Chi_Minh"},{"name":"reports:rebuild","expr":"*/5 * * * *","tz":"UTC"}]}
+```
+A long schedule is split over several `list` events of at most 8 KiB of
+tasks each, so every line stays under the 16 KiB target.
 
 **heartbeat** — worker liveness, every `MT_HEARTBEAT_SECONDS`.
 ```json
@@ -306,14 +317,28 @@ skipped by sampling), `errors` (swallowed internal errors).
   create the task, without missed-run detection until a schedule is set.
 - Each run: `start`, then `success` or `fail` (or a lone `skip`). A run is
   keyed by **name + scheduled minute**: for `start`/`skip` the slot is
+  `scheduled` when sent (and a fire of the schedule), else
   `floor_minute(ts)`; for `success`/`fail` it is
   `floor_minute(ts − duration_ms)` — so finish events pair with their start
-  without client state, even across pods.
+  without client state, even across pods. `scheduled` matters when the
+  scheduler runs due tasks one after another: a task queued behind a long
+  foreground task starts minutes late, and without it would land on a later
+  slot and leave its own looking missed.
 - A finish without `duration_ms` (Laravel `runInBackground()` tasks report
   from a separate `schedule:finish` process) pairs with the most recent open
   `start` of the same task.
 - A `start` with no finish is marked unfinished after the task's grace
   period; an expected slot with no `start` is a missed run.
+- Schedulers that can see their schedule send `list` every 5 minutes
+  (Laravel: from `schedule:run` at minutes divisible by 5, tasks limited to
+  the current environment). A listed task that is unknown is registered; a
+  task of that app and scheduler left out of the listings for 12 minutes
+  becomes **inactive** (no missed runs, no alerts) until it is listed
+  again. Several scheduler pods may list different shares of the
+  schedule: a task counts as listed when any of them lists it. Apps whose
+  SDK does not send `list` are unaffected.
+- K8s CronJob tasks become inactive the same way when the CronJob is
+  suspended or deleted (the backend reads the CronJob list itself).
 
 ```
 {"_mt":1,"type":"cron","ts":"2026-09-21T09:00:00.031+07:00","level":"info","message":"Scheduled task started: invoices:send-reminders",...,"cron":{"name":"invoices:send-reminders","expr":"0 9 * * 1-5","tz":"Asia/Ho_Chi_Minh","phase":"start"}}

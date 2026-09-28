@@ -2,6 +2,7 @@
 
 namespace MonitorTrack\Listeners;
 
+use Illuminate\Console\Events\CommandStarting;
 use Illuminate\Console\Events\ScheduledBackgroundTaskFinished;
 use Illuminate\Console\Events\ScheduledTaskFailed;
 use Illuminate\Console\Events\ScheduledTaskFinished;
@@ -9,6 +10,8 @@ use Illuminate\Console\Events\ScheduledTaskSkipped;
 use Illuminate\Console\Events\ScheduledTaskStarting;
 use Illuminate\Console\Scheduling\CallbackEvent;
 use Illuminate\Console\Scheduling\Event;
+use Illuminate\Console\Scheduling\Schedule;
+use Illuminate\Container\Container;
 use Illuminate\Contracts\Events\Dispatcher;
 use MonitorTrack\Client;
 use MonitorTrack\Support\EnvelopeEncoder;
@@ -24,11 +27,22 @@ use MonitorTrack\Support\EnvelopeEncoder;
  *   exception:    Starting → Failed
  *   background:   Starting → Finished (no exit code yet), later in the
  *                 `schedule:finish` process: ScheduledBackgroundTaskFinished
+ *
+ * `schedule:run` runs its due tasks one after another, so a task queued
+ * behind a long foreground one starts minutes late: start/skip events carry
+ * `scheduled`, the minute that `schedule:run` started, which is the slot.
+ * Every LIST_EVERY_MINUTES the whole schedule is listed (phase=list), so a
+ * renamed or removed task stops being expected.
  */
 final class ScheduleListener
 {
+    private const LIST_EVERY_MINUTES = 5;
+
     /** @var array<int, int|float> spl_object_id(task) => hrtime start */
     private array $started = [];
+
+    /** Unix seconds of the minute this `schedule:run` started, if it is one. */
+    private ?int $runMinute = null;
 
     private string $defaultTimezone;
 
@@ -39,6 +53,7 @@ final class ScheduleListener
 
     public function subscribe(Dispatcher $events): void
     {
+        $events->listen(CommandStarting::class, [$this, 'commandStarting']);
         $events->listen(ScheduledTaskStarting::class, [$this, 'starting']);
         $events->listen(ScheduledTaskFinished::class, [$this, 'finished']);
         $events->listen(ScheduledTaskFailed::class, [$this, 'failed']);
@@ -49,11 +64,48 @@ final class ScheduleListener
         }
     }
 
+    public function commandStarting(CommandStarting $event): void
+    {
+        try {
+            if ($event->command !== 'schedule:run') {
+                return;
+            }
+
+            $minute = intdiv(time(), 60);
+            $this->runMinute = $minute * 60;
+
+            if ($minute % self::LIST_EVERY_MINUTES === 0) {
+                $container = Container::getInstance();
+                $env = method_exists($container, 'environment') ? (string) $container->environment() : null;
+                $this->listSchedule($container->make(Schedule::class), $env);
+            }
+        } catch (\Throwable) {
+        }
+    }
+
+    /**
+     * Sends the tasks of $schedule that run in $env (all when null).
+     */
+    public function listSchedule(Schedule $schedule, ?string $env = null): void
+    {
+        try {
+            $tasks = [];
+            foreach ($schedule->events() as $task) {
+                if ($env !== null && ! $task->runsInEnvironment($env)) {
+                    continue;
+                }
+                $tasks[] = $this->describe($task);
+            }
+            $this->client->cronList($tasks);
+        } catch (\Throwable) {
+        }
+    }
+
     public function starting(ScheduledTaskStarting $event): void
     {
         try {
             $this->started[spl_object_id($event->task)] = hrtime(true);
-            $this->client->cron('start', $this->describe($event->task));
+            $this->client->cron('start', $this->describe($event->task) + $this->slot($event->task));
         } catch (\Throwable) {
         }
     }
@@ -114,7 +166,7 @@ final class ScheduleListener
     public function skipped(ScheduledTaskSkipped $event): void
     {
         try {
-            $this->client->cron('skip', $this->describe($event->task));
+            $this->client->cron('skip', $this->describe($event->task) + $this->slot($event->task));
         } catch (\Throwable) {
         }
     }
@@ -160,6 +212,21 @@ final class ScheduleListener
         }
 
         return null;
+    }
+
+    /**
+     * `scheduled` for a start/skip seen by `schedule:run`; none for
+     * sub-minute tasks, which run many times in its minute.
+     *
+     * @return array{scheduled?:int}
+     */
+    private function slot(Event $task): array
+    {
+        if ($this->runMinute === null || (method_exists($task, 'isRepeatable') && $task->isRepeatable())) {
+            return [];
+        }
+
+        return ['scheduled' => $this->runMinute];
     }
 
     /**

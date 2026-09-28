@@ -2,6 +2,7 @@
 
 namespace MonitorTrack\Tests\Feature;
 
+use Illuminate\Console\Events\CommandStarting;
 use Illuminate\Console\Events\ScheduledBackgroundTaskFinished;
 use Illuminate\Console\Events\ScheduledTaskFailed;
 use Illuminate\Console\Events\ScheduledTaskFinished;
@@ -10,10 +11,13 @@ use Illuminate\Console\Events\ScheduledTaskStarting;
 use Illuminate\Console\Scheduling\CallbackEvent;
 use Illuminate\Console\Scheduling\Event;
 use Illuminate\Console\Scheduling\EventMutex;
+use Illuminate\Console\Scheduling\Schedule;
 use MonitorTrack\Listeners\ScheduleListener;
 use MonitorTrack\Stats;
 use MonitorTrack\Tests\TestCase;
 use MonitorTrack\Transport\HttpTransport;
+use Symfony\Component\Console\Input\ArrayInput;
+use Symfony\Component\Console\Output\NullOutput;
 
 class ScheduleListenerTest extends TestCase
 {
@@ -181,5 +185,111 @@ class ScheduleListenerTest extends TestCase
         $output = $memory->events('cron')[1]['cron']['output'];
         $this->assertStringEndsWith("Error: SMTP 421\n", $output);
         $this->assertLessThanOrEqual(8192, strlen($output));
+    }
+
+    private function scheduleRunStarts(): array
+    {
+        $before = intdiv(time(), 60) * 60;
+        event(new CommandStarting('schedule:run', new ArrayInput([]), new NullOutput()));
+
+        return [$before, intdiv(time(), 60) * 60];
+    }
+
+    public function test_start_and_skip_carry_the_minute_schedule_run_started(): void
+    {
+        $memory = $this->fake();
+        $minutes = $this->scheduleRunStarts();
+        $task = $this->task();
+
+        event(new ScheduledTaskStarting($task));
+        $task->exitCode = 0;
+        event(new ScheduledTaskFinished($task, 0.01));
+        event(new ScheduledTaskSkipped($this->task('php artisan other:thing')));
+
+        [$start, $success, $skip] = array_column($memory->events('cron'), 'cron');
+        $this->assertContains($start['scheduled'], $minutes);
+        $this->assertSame(0, $start['scheduled'] % 60);
+        $this->assertSame($start['scheduled'], $skip['scheduled']);
+        $this->assertArrayNotHasKey('scheduled', $success, 'finish events pair by their start');
+    }
+
+    public function test_other_commands_and_sub_minute_tasks_carry_no_slot(): void
+    {
+        $memory = $this->fake();
+        event(new CommandStarting('queue:work', new ArrayInput([]), new NullOutput()));
+        event(new ScheduledTaskStarting($this->task()));
+        $this->assertArrayNotHasKey('scheduled', $memory->events('cron')[0]['cron']);
+
+        $this->scheduleRunStarts();
+        $fast = $this->task('php artisan ticks:poll', '* * * * *');
+        if (! method_exists($fast, 'everyThirtySeconds')) {
+            $this->markTestSkipped('no sub-minute tasks before Laravel 10.x');
+        }
+        $fast->everyThirtySeconds();
+        event(new ScheduledTaskStarting($fast));
+        $this->assertArrayNotHasKey('scheduled', $memory->events('cron')[1]['cron']);
+    }
+
+    public function test_schedule_is_listed_for_the_current_environment(): void
+    {
+        $memory = $this->fake();
+        $schedule = new Schedule('UTC');
+        $schedule->command('invoices:send-reminders')->weekdays()->at('09:00');
+        $schedule->command('reports:rebuild --fast')->everyFiveMinutes()->timezone('Asia/Ho_Chi_Minh');
+        $schedule->command('staging:only')->daily()->environments('staging');
+        $schedule->call(fn () => null)->name('prune-sessions')->hourly();
+
+        (new ScheduleListener($this->client()))->listSchedule($schedule, 'production');
+
+        $events = $memory->events('cron');
+        $this->assertCount(1, $events);
+        $this->assertSame('list', $events[0]['cron']['phase']);
+        $this->assertSame('debug', $events[0]['level']);
+        $this->assertSame('Schedule listed: 3 tasks', $events[0]['message']);
+        $this->assertSame([
+            ['name' => 'invoices:send-reminders', 'expr' => '0 9 * * 1-5', 'tz' => 'UTC'],
+            ['name' => 'reports:rebuild --fast', 'expr' => '*/5 * * * *', 'tz' => 'Asia/Ho_Chi_Minh'],
+            ['name' => 'prune-sessions', 'expr' => '0 * * * *', 'tz' => 'UTC'],
+        ], $events[0]['cron']['tasks']);
+    }
+
+    public function test_long_schedule_is_listed_in_parts_under_the_line_target(): void
+    {
+        $memory = $this->fake();
+        $schedule = new Schedule('UTC');
+        for ($i = 0; $i < 300; $i++) {
+            $schedule->command("sync:marketplace-orders --platform={$i} --chunk=500 --with-refunds --since=2days")->everyMinute();
+        }
+
+        (new ScheduleListener($this->client()))->listSchedule($schedule);
+
+        $events = $memory->events('cron');
+        $this->assertGreaterThan(1, count($events));
+        $names = [];
+        foreach ($events as $i => $event) {
+            $this->assertSame('list', $event['cron']['phase']);
+            $this->assertStringEndsWith('('.($i + 1).'/'.count($events).')', $event['message']);
+            $this->assertLessThan(16384, strlen(json_encode($event)));
+            $names = array_merge($names, array_column($event['cron']['tasks'], 'name'));
+        }
+        $this->assertCount(300, $names);
+        $this->assertSame('sync:marketplace-orders --platform=299 --chunk=500 --with-refunds --since=2days', end($names));
+    }
+
+    public function test_schedule_run_lists_the_schedule_every_five_minutes(): void
+    {
+        $memory = $this->fake();
+        $this->app->make(Schedule::class)->command('invoices:send-reminders')->daily();
+
+        $minute = $this->scheduleRunStarts();
+        $lists = array_filter($memory->events('cron'), fn ($e) => $e['cron']['phase'] === 'list');
+        if (intdiv($minute[0], 60) % 5 === 0 && $minute[0] === $minute[1]) {
+            $this->assertCount(1, $lists);
+            $this->assertContains('invoices:send-reminders', array_column(reset($lists)['cron']['tasks'], 'name'));
+        } elseif (intdiv($minute[1], 60) % 5 !== 0 && $minute[0] === $minute[1]) {
+            $this->assertCount(0, $lists);
+        } else {
+            $this->addToAssertionCount(1); // crossed a minute: either is right
+        }
     }
 }
