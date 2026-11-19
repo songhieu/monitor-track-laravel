@@ -10,6 +10,7 @@ use MonitorTrack\Transport\FileTransport;
 use MonitorTrack\Transport\HttpTransport;
 use MonitorTrack\Transport\MemoryTransport;
 use MonitorTrack\Transport\NullTransport;
+use MonitorTrack\Transport\Spool;
 use MonitorTrack\Transport\StreamTransport;
 use MonitorTrack\Transport\Transport;
 
@@ -110,7 +111,8 @@ class Client
      * @return array{enabled:bool, transport:string, stream:string, file:string, endpoint:string, token:string,
      *     app:string, env:string, release:string, host:string, sample_rate:float, queue_size:int,
      *     heartbeat_seconds:int, slow_query_ms:float, n_plus_one:int, query_throttle_seconds:int,
-     *     long_running_commands:list<string>, base_path:string, http_connect_timeout_ms:int, http_timeout_ms:int}
+     *     long_running_commands:list<string>, base_path:string, http_connect_timeout_ms:int, http_timeout_ms:int,
+     *     http_console_timeout_ms:int, spool:bool, spool_path:string, spool_max_bytes:int, spool_max_age_seconds:int}
      */
     public static function normalizeOptions(array $raw): array
     {
@@ -131,10 +133,14 @@ class Client
             return in_array(strtolower($str($v)), ['false', 'off', 'no', '(false)'], true) ? 0.0 : $default;
         };
 
-        $enabled = $raw['enabled'] ?? true;
-        if (! is_bool($enabled)) {
-            $enabled = ! in_array(strtolower($str($enabled)), ['false', '0', 'off', 'no', '(false)'], true);
-        }
+        $flag = static function ($v) use ($str): bool {
+            return is_bool($v) ? $v : ! in_array(strtolower($str($v)), ['false', '0', 'off', 'no', '(false)'], true);
+        };
+        $positive = static function ($v, int $default): int {
+            return is_numeric($v) && (float) $v > 0 ? (int) round((float) $v) : $default;
+        };
+
+        $enabled = $flag($raw['enabled'] ?? true);
 
         $transport = strtolower($str($raw['transport'] ?? 'stream'));
         if (! in_array($transport, ['stream', 'file', 'http'], true)) {
@@ -188,8 +194,13 @@ class Client
             'query_throttle_seconds' => (int) $threshold($raw['query_throttle_seconds'] ?? null, 60.0),
             'long_running_commands' => $longRunning,
             'base_path' => rtrim($str($raw['base_path'] ?? ''), '/\\'),
-            'http_connect_timeout_ms' => (int) ($raw['http_connect_timeout_ms'] ?? 500),
-            'http_timeout_ms' => (int) ($raw['http_timeout_ms'] ?? 1000),
+            'http_connect_timeout_ms' => $positive($raw['http_connect_timeout_ms'] ?? null, 500),
+            'http_timeout_ms' => $positive($raw['http_timeout_ms'] ?? null, 1000),
+            'http_console_timeout_ms' => $positive($raw['http_console_timeout_ms'] ?? null, 5000),
+            'spool' => $flag($raw['spool'] ?? true),
+            'spool_path' => $str($raw['spool_path'] ?? ''),
+            'spool_max_bytes' => (int) round(1024 * 1024 * ($threshold($raw['spool_max_mb'] ?? null, 20.0))),
+            'spool_max_age_seconds' => $positive($raw['spool_max_age_seconds'] ?? null, 3600),
         ];
     }
 
@@ -202,7 +213,10 @@ class Client
             'file' => new FileTransport($o['file'], $this->stats),
             'http' => new HttpTransport(
                 $o['endpoint'], $o['token'], $o['queue_size'], $this->stats,
-                $o['http_connect_timeout_ms'], $o['http_timeout_ms'],
+                $o['http_connect_timeout_ms'], $o['http_timeout_ms'], null,
+                $o['spool'] && $o['spool_max_bytes'] > 0
+                    ? Spool::forIngest($o['spool_path'], $o['endpoint'], $o['token'], $o['spool_max_bytes'], $o['spool_max_age_seconds'])
+                    : null,
             ),
             default => new StreamTransport('php://'.$o['stream'], $this->stats),
         };
@@ -298,6 +312,21 @@ class Client
     public function setFlushOnRecord(bool $on): void
     {
         $this->flushOnRecord = $on;
+    }
+
+    /**
+     * Total time one http request may take, for the transport's next sends
+     * (no-op for other transports).
+     */
+    public function setHttpTimeout(int $timeoutMs): void
+    {
+        try {
+            if ($this->transport instanceof HttpTransport) {
+                $this->transport->setTimeoutMs($timeoutMs);
+            }
+        } catch (\Throwable) {
+            $this->stats->errors++;
+        }
     }
 
     /**

@@ -65,8 +65,22 @@ return [
     ],
 
     // http transport timeouts (per request; one quick retry on connection errors).
+    // console_timeout_ms applies to artisan commands and the scheduler, which
+    // no user waits on; web requests, Octane and queue workers use timeout_ms.
     'http' => [
         'connect_timeout_ms' => 500,
-        'timeout_ms' => 1000,
+        'timeout_ms' => env('MT_HTTP_TIMEOUT_MS', 1000),
+        'console_timeout_ms' => env('MT_HTTP_CONSOLE_TIMEOUT_MS', 5000),
+    ],
+
+    // http transport: a batch the ingest can't take right now (no connection,
+    // timeout, 429, 502-504) is written to this local directory and sent
+    // again by the next process that reaches the ingest, instead of being
+    // dropped. Bounded by size and age; MT_SPOOL=false drops failed batches.
+    'spool' => [
+        'enabled' => env('MT_SPOOL', true),
+        'path' => env('MT_SPOOL_PATH'),                  // default: <system temp dir>/monitor-track-spool
+        'max_mb' => env('MT_SPOOL_MAX_MB', 20),
+        'max_age_seconds' => env('MT_SPOOL_MAX_AGE_SECONDS', 3600),
     ],
 ];

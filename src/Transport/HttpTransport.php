@@ -11,13 +11,17 @@ use MonitorTrack\Stats;
  * Nothing is sent while a request or job runs. The service provider flushes
  * from app()->terminating() (after the response under FPM; under Octane only
  * when due), from the queue worker's Looping event (every 2 s / 500 lines)
- * and from a shutdown function. A failed batch is dropped: one quick retry on
- * a connection error, no loops.
+ * and from a shutdown function. One quick retry on a connection error, no
+ * loops.
  *
- * When the ingest can't be reached or answers 429 / 502-504, long-running
- * processes stop trying for a while (5 s, doubling up to 60 s): flushIfDue()
- * keeps buffering (bounded) and flush() drops the buffer at once, so an
- * outage never stalls a worker on every flush.
+ * When the ingest can't be reached, times out or answers 429 / 502-504, the
+ * batch goes to the local disk spool (when there is one) instead of being
+ * dropped, and long-running processes stop trying for a while (5 s, doubling
+ * up to 60 s): flushIfDue() keeps buffering (bounded) and flush() spools the
+ * buffer at once, so an outage never stalls a worker on every flush. After
+ * its next successful POST, any process of the app sends one spooled batch
+ * again, with its original Idempotency-Key. Other failures (401, 413, 500)
+ * would fail again and are dropped.
  */
 final class HttpTransport implements Transport
 {
@@ -26,6 +30,9 @@ final class HttpTransport implements Transport
     public const BATCH_BYTES = 4 * 1024 * 1024;
 
     public const FLUSH_INTERVAL = 2.0;
+
+    /** Spooled batches sent again per flush, after a successful POST. */
+    public const RESEND_PER_FLUSH = 1;
 
     private const MIN_BACKOFF = 5.0;
 
@@ -47,6 +54,7 @@ final class HttpTransport implements Transport
     /**
      * @param  (callable(string, list<string>, string): array{status:int, retryable:bool})|null  $sender
      *                                                                                               replaces the curl call (tests)
+     * @param  Spool|null  $spool  where failed batches wait to be sent again (null: dropped)
      */
     public function __construct(
         private string $endpoint,
@@ -56,6 +64,7 @@ final class HttpTransport implements Transport
         private int $connectTimeoutMs = 500,
         private int $timeoutMs = 1000,
         ?callable $sender = null,
+        private ?Spool $spool = null,
     ) {
         $this->sender = $sender;
         $this->lastFlush = microtime(true);
@@ -64,6 +73,27 @@ final class HttpTransport implements Transport
     public function url(): string
     {
         return rtrim($this->endpoint, '/').'/api/v1/logs/ingest';
+    }
+
+    public function spool(): ?Spool
+    {
+        return $this->spool;
+    }
+
+    /**
+     * Total time one request may take. Console commands and the scheduler
+     * use a longer one than web and queue workers (see the service provider).
+     */
+    public function setTimeoutMs(int $timeoutMs): void
+    {
+        if ($timeoutMs > 0) {
+            $this->timeoutMs = $timeoutMs;
+        }
+    }
+
+    public function timeoutMs(): int
+    {
+        return $this->timeoutMs;
     }
 
     public function send(string $line): bool
@@ -105,63 +135,150 @@ final class HttpTransport implements Transport
 
         try {
             if ($this->buffer !== [] && $this->lastFlush < $this->retryAt) {
-                // The ingest failed moments ago: give up now instead of
-                // waiting for another timeout.
-                $this->stats->dropped += count($this->buffer);
+                // The ingest failed moments ago: keep the lines for later
+                // instead of waiting for another timeout.
+                $this->park($this->buffer);
                 $this->buffer = [];
 
                 return;
             }
 
+            $sent = false;
             while ($this->buffer !== []) {
                 if ($deadline !== null && microtime(true) >= $deadline) {
-                    $this->stats->dropped += count($this->buffer);
+                    $this->park($this->buffer);
                     $this->buffer = [];
 
                     return;
                 }
 
-                $batch = $this->takeBatch();
-                $status = $this->post($batch);
+                $key = bin2hex(random_bytes(8));
+                $batch = self::take($this->buffer);
+                $status = $this->post(implode('', $batch), $key);
 
                 if ($status >= 200 && $status < 300) {
                     $this->backoff = 0.0;
+                    $sent = true;
 
                     continue;
                 }
 
-                $this->stats->dropped += count($batch);
-
-                if ($status === 0 || $status === 429 || ($status >= 502 && $status <= 504)) {
-                    // Unreachable or overloaded: the rest waits for a flush
-                    // after the backoff.
-                    $this->backoff = min(self::MAX_BACKOFF, max(self::MIN_BACKOFF, $this->backoff * 2));
-                    $this->retryAt = microtime(true) + $this->backoff;
+                if (self::unavailable($status)) {
+                    // Unreachable or overloaded: this batch waits in the
+                    // spool, the rest for a flush after the backoff.
+                    $this->park($batch, $key);
+                    $this->backOff();
 
                     return;
                 }
+
+                $this->stats->dropped += count($batch);
+            }
+
+            if ($sent) {
+                $this->resend($deadline);
             }
         } catch (\Throwable) {
             $this->stats->errors++;
-            $this->stats->dropped += count($this->buffer);
+            $this->park($this->buffer);
             $this->buffer = [];
         }
     }
 
     /**
+     * The ingest just took a batch: send spooled ones while it is reachable.
+     */
+    private function resend(?float $deadline): void
+    {
+        if ($this->spool === null) {
+            return;
+        }
+
+        for ($i = 0; $i < self::RESEND_PER_FLUSH; $i++) {
+            if ($deadline !== null && microtime(true) >= $deadline) {
+                return;
+            }
+
+            $expired = 0;
+            $claim = $this->spool->claim($expired);
+            $this->stats->dropped += $expired;
+            if ($claim === null) {
+                return;
+            }
+
+            [$file, $key, $body] = $claim;
+            $status = $this->post($body, $key);
+
+            if ($status >= 200 && $status < 300) {
+                $this->spool->done($file);
+
+                continue;
+            }
+
+            if (self::unavailable($status)) {
+                $this->spool->release($file);
+                $this->backOff();
+
+                return;
+            }
+
+            // Refused for good (401, 413, 500): it would never be accepted.
+            $this->stats->dropped += substr_count($body, "\n");
+            $this->spool->done($file);
+        }
+    }
+
+    /**
+     * Keeps lines that could not be sent in the spool, in batches of the
+     * size we send, or counts them as dropped. Never throws.
+     *
+     * @param  list<string>  $lines
+     */
+    private function park(array $lines, ?string $key = null): void
+    {
+        while ($lines !== []) {
+            $batch = self::take($lines);
+            try {
+                $kept = $this->spool !== null && $this->spool->put($batch, $key ?? bin2hex(random_bytes(8)));
+            } catch (\Throwable) {
+                $kept = false;
+            }
+            if (! $kept) {
+                $this->stats->dropped += count($batch);
+            }
+            $key = null;
+        }
+    }
+
+    private function backOff(): void
+    {
+        $this->backoff = min(self::MAX_BACKOFF, max(self::MIN_BACKOFF, $this->backoff * 2));
+        $this->retryAt = microtime(true) + $this->backoff;
+    }
+
+    /** Answers a later attempt can fix: no response, 429, 502-504. */
+    private static function unavailable(int $status): bool
+    {
+        return $status === 0 || $status === 429 || ($status >= 502 && $status <= 504);
+    }
+
+    /**
+     * Removes the next batch (BATCH_LINES / BATCH_BYTES) from the front of $lines.
+     *
+     * @param  list<string>  $lines
      * @return list<string>
      */
-    private function takeBatch(): array
+    private static function take(array &$lines): array
     {
         $batch = [];
         $bytes = 0;
 
-        while ($this->buffer !== [] && count($batch) < self::BATCH_LINES) {
-            $len = strlen($this->buffer[0]);
+        while ($lines !== [] && count($batch) < self::BATCH_LINES) {
+            $len = strlen($lines[0]);
             if ($batch !== [] && $bytes + $len > self::BATCH_BYTES) {
                 break;
             }
-            $batch[] = array_shift($this->buffer);
+            $batch[] = array_shift($lines);
             $bytes += $len;
         }
 
@@ -169,15 +286,13 @@ final class HttpTransport implements Transport
     }
 
     /**
-     * @param  list<string>  $batch
      * @return int the response status, 0 = no response
      */
-    private function post(array $batch): int
+    private function post(string $body, string $key): int
     {
-        $body = implode('', $batch);
         $headers = [
             'Content-Type: application/x-ndjson',
-            'Idempotency-Key: '.bin2hex(random_bytes(8)),
+            'Idempotency-Key: '.$key,
             'User-Agent: monitor-track-laravel/1',
         ];
 
@@ -260,8 +375,9 @@ final class HttpTransport implements Transport
 
         if ($errno !== 0) {
             // 7 couldn't connect, 52 empty reply, 55 send error, 56 recv error
-            // (reset). Timeouts (28) are not retried: the server may have the
-            // batch and we must not stall the process.
+            // (reset). Timeouts (28) are not retried here: the server may
+            // have the batch and we must not stall the process. The batch is
+            // spooled and sent again later with the same Idempotency-Key.
             return ['status' => 0, 'retryable' => in_array($errno, [7, 52, 55, 56], true)];
         }
 

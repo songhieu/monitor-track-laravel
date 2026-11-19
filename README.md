@@ -80,6 +80,12 @@ These `MT_*` variables are the same in the Go and Python SDKs.
 | `MT_N_PLUS_ONE` | `10` | report a statement run this many times in one request / job / command (minimum 2); `0` turns it off |
 | `MT_QUERY_THROTTLE_SECONDS` | `60` | at most one query event per statement and call site per window per server; `0` sends every one |
 | `MT_LONG_RUNNING_COMMANDS` | — | your own daemon commands, comma-separated names or patterns (`distribution:*`): not a query scope themselves, like `queue:work` |
+| `MT_HTTP_TIMEOUT_MS` | `1000` | http transport: total time per request for web requests, Octane and queue workers |
+| `MT_HTTP_CONSOLE_TIMEOUT_MS` | `5000` | http transport: total time per request for artisan commands and the scheduler |
+| `MT_SPOOL` | `true` | http transport: keep batches the ingest can't take on local disk and send them again (see [Transports](#transports)) |
+| `MT_SPOOL_PATH` | system temp dir + `/monitor-track-spool` | spool directory (one subdirectory per endpoint and token) |
+| `MT_SPOOL_MAX_MB` | `20` | spool size cap; a new batch is dropped when it is full |
+| `MT_SPOOL_MAX_AGE_SECONDS` | `3600` | spooled batches older than this are deleted unsent |
 
 With `MT_TRANSPORT=http` and no `MT_ENDPOINT`, the SDK falls back to `stream`.
 `config/monitor-track.php` also has `capture.exceptions|queue|schedule|queries`
@@ -251,11 +257,24 @@ $this->assertCount(1, $events->events('exception'));
   `WorkerStopping`; Horizon's master and supervisor processes send from their
   once-a-second loop. Octane workers send when due, see
   [Laravel Octane](#laravel-octane). A shutdown function is the last resort.
-  Each request has a 0.5 s connect timeout and a 1 s total timeout. A
-  connection error gets one retry after 200 ms. Any non-2xx response drops
-  the batch. When the ingest can't be reached or answers 429 / 502–504, a
-  long-running process stops trying for 5 s, doubling up to 60 s: events keep
-  being buffered (up to `MT_QUEUE_SIZE`) and go out when it is back.
+  Each request has a 0.5 s connect timeout and a 1 s total timeout (5 s for
+  artisan commands and the scheduler, which nobody waits on; queue workers
+  switch back to 1 s at their first loop). A connection error gets one retry
+  after 200 ms. When the ingest can't be reached, times out or answers 429 /
+  502–504, the batch is written to a local spool directory instead of being
+  dropped, and a long-running process stops trying for 5 s, doubling up to
+  60 s: events keep being buffered (up to `MT_QUEUE_SIZE`). After its next
+  successful POST, any process of the app on the same host sends one spooled
+  batch again, oldest first, with its original `Idempotency-Key`. Processes
+  share the spool without locks (a batch is taken by renaming its file), the
+  spool holds at most `MT_SPOOL_MAX_MB` and drops batches older than
+  `MT_SPOOL_MAX_AGE_SECONDS`. In Kubernetes the default directory is the
+  container's own `/tmp`, so what a pod spooled is sent by that pod and lost
+  with it. The SDK only writes into a spool directory owned by the user PHP
+  runs as (mode `0700`); on a VM where artisan and PHP-FPM run as different
+  users, point `MT_SPOOL_PATH` at a directory each can own, or that user's
+  failed batches are dropped as before. Other non-2xx answers (401, 413, 500) would fail again and drop
+  the batch.
 
 ## Laravel Octane
 
@@ -302,9 +321,13 @@ transport under Octane.
   (1000), and the newest are dropped when it is full. Context is walked at
   most 5 levels deep and 100 items per level.
 - **Bounded time.** Each http request has a 0.5 s connect and 1 s total
-  timeout, with one quick retry and no loops. `flush()` stops at its budget.
-  After a failed send, long-running processes (queue workers, Octane) back
-  off for 5–60 s instead of waiting for the timeout at every flush.
+  timeout (5 s in artisan commands and the scheduler), with one quick retry
+  and no loops. `flush()` stops at its budget. After a failed send,
+  long-running processes (queue workers, Octane) back off for 5–60 s instead
+  of waiting for the timeout at every flush, and resend at most one spooled
+  batch per flush.
+- **Bounded disk.** Failed batches go to a spool capped by size (20 MB) and
+  age (1 h). Nothing is written to disk until a batch fails.
 - **Bounded size.** Lines stay under 16 KiB where possible and never exceed
   32 KiB. The message, output and context are truncated first, and the event
   is dropped only as a last resort. Output is always a single line.

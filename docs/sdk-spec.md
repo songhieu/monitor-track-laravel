@@ -215,10 +215,11 @@ Idempotency-Key: 5f0c2a7e9b1d4c33 (optional, random per batch)
 | 202 | accepted |
 | 401 | bad token — drop batch |
 | 413 | too large — drop batch |
-| 429 | rate limited — drop batch (Laravel: and back off) |
-| 503 | backend busy — drop batch (Laravel: and back off) |
-| other / timeout | drop batch |
-| connection refused/reset before a response | one quick retry (≈200 ms later, same `Idempotency-Key`), then drop |
+| 429 | rate limited — drop batch (Laravel: spool it and back off) |
+| 502 / 503 / 504 | backend busy — drop batch (Laravel: spool it and back off) |
+| timeout | drop batch (Laravel: spool it and back off) |
+| other | drop batch |
+| connection refused/reset before a response | one quick retry (≈200 ms later, same `Idempotency-Key`), then drop (Laravel: spool) |
 
 Server limits: 5 MiB body (decompressed), 10 000 lines, 256 KiB per line.
 
@@ -228,8 +229,10 @@ SDK behaviour:
   and counted. Enqueue never blocks.
 - A background worker (goroutine / daemon thread) flushes every **2 s** or when
   **500** events are queued; a batch is ≤ 500 lines and ≤ 4 MiB uncompressed.
-- Timeout **2 s** per request (Laravel: 0.5 s connect, 1 s total). No retry
-  loops, no backoff queues: a failed batch is dropped and counted.
+- Timeout **2 s** per request (Laravel: 0.5 s connect, 1 s total; 5 s total
+  in artisan commands and the scheduler until a queue worker loop starts).
+  No retry loops: a failed batch is dropped and counted (Laravel: spooled,
+  see below).
 - Laravel (no threads) buffers during the request and sends once from
   `app()->terminating()` (after the response under FPM, and when an artisan
   command ends). A console process also flushes when due (2 s / 500 events)
@@ -253,8 +256,20 @@ SDK behaviour:
 - Laravel backoff: after a batch gets no response, 429 or 502–504, a
   long-running process skips scheduled flushes for 5 s, doubling up to 60 s
   and reset by the next accepted batch. Events keep being buffered (bounded,
-  newest dropped); a `flush()` during the pause drops the buffer at once
+  newest dropped); a `flush()` during the pause spools the buffer at once
   instead of waiting for another timeout.
+- Laravel spool (`MT_SPOOL`, on by default): a batch that got no response,
+  429 or 502–504 is written to a local directory (`MT_SPOOL_PATH`, default
+  `<temp dir>/monitor-track-spool/<sha1(endpoint, token)>`), one file per
+  batch named `<spooled at, µs>-<Idempotency-Key>.ndjson`. After an accepted
+  batch, the process takes the oldest spooled file by renaming it (so exactly
+  one process sends it), POSTs it with its original `Idempotency-Key`, and
+  deletes it on 2xx; on another "unavailable" answer it renames it back and
+  backs off. One spooled batch per flush. Bounded: `MT_SPOOL_MAX_MB` (20,
+  new batches are dropped when full), `MT_SPOOL_MAX_AGE_SECONDS` (3600, older
+  batches are deleted unsent and counted as dropped); a file taken by a
+  process that died is taken again after 120 s. Nothing is written until a
+  batch fails, and any disk error falls back to dropping.
 - `flush(timeout)` / `close(timeout)` send what is queued and return by the
   deadline even if the server hangs. Python registers an `atexit` flush.
 
@@ -280,6 +295,8 @@ Same environment variables in every SDK (options passed in code win):
 | `MT_N_PLUS_ONE` | `10` | (Laravel) report a statement run this many times in one scope (minimum 2); `0` = off |
 | `MT_QUERY_THROTTLE_SECONDS` | `60` | (Laravel) at most one query event per statement and call site per window per server; `0` = no throttle |
 | `MT_LONG_RUNNING_COMMANDS` | — | (Laravel) comma-separated artisan command names or `*` patterns that are long-running like `queue:work` (section 10) |
+| `MT_HTTP_TIMEOUT_MS` / `MT_HTTP_CONSOLE_TIMEOUT_MS` | `1000` / `5000` | (Laravel) http request timeout; the console one applies to artisan commands and the scheduler |
+| `MT_SPOOL`, `MT_SPOOL_PATH`, `MT_SPOOL_MAX_MB`, `MT_SPOOL_MAX_AGE_SECONDS` | `true`, temp dir, `20`, `3600` | (Laravel) local spool for batches the ingest couldn't take (section 4) |
 
 `MT_TRANSPORT=http` without `MT_ENDPOINT` falls back to `stream`.
 

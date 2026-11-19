@@ -10,7 +10,7 @@ final class Stats
     /** Events written, or accepted into the http buffer. */
     public int $emitted = 0;
 
-    /** Events lost: buffer full, line too large, failed http batch, write error. */
+    /** Events lost: buffer full, line too large, failed http batch not kept in the spool, expired spool batch, write error. */
     public int $dropped = 0;
 
     /** Log events skipped by MT_SAMPLE_RATE. */

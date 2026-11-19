@@ -14,8 +14,14 @@ class HttpTransportTest extends TestCase
 
     private ?string $dir = null;
 
+    /** @var list<string> */
+    private array $spoolDirs = [];
+
     protected function tearDown(): void
     {
+        array_map([self::class, 'removeTree'], $this->spoolDirs);
+        $this->spoolDirs = [];
+
         foreach ($this->processes as $process) {
             @proc_terminate($process);
             @proc_close($process);
@@ -26,6 +32,26 @@ class HttpTransportTest extends TestCase
             array_map('unlink', glob($this->dir.'/*') ?: []);
             @rmdir($this->dir);
         }
+    }
+
+    private static function removeTree(string $path): void
+    {
+        if (is_dir($path) && ! is_link($path)) {
+            foreach (array_diff(scandir($path) ?: [], ['.', '..']) as $entry) {
+                self::removeTree($path.'/'.$entry);
+            }
+            @rmdir($path);
+        } elseif (file_exists($path)) {
+            @unlink($path);
+        }
+    }
+
+    private function spoolDir(): string
+    {
+        $dir = sys_get_temp_dir().'/mt-spool-test-'.bin2hex(random_bytes(4));
+        $this->spoolDirs[] = $dir;
+
+        return $dir;
     }
 
     private static function freePort(): int
@@ -114,24 +140,39 @@ class HttpTransportTest extends TestCase
         $this->assertSame(0, $client->transport()->pending());
     }
 
-    public function test_503_drops_the_batch_without_retrying(): void
+    public function test_503_spools_the_batch_without_retrying(): void
     {
         $endpoint = $this->ingestServer(503);
-        $client = new Client(['transport' => 'http', 'endpoint' => $endpoint, 'token' => 't']);
+        $client = new Client(['transport' => 'http', 'endpoint' => $endpoint, 'token' => 't', 'spool_path' => $this->spoolDir()]);
 
         $client->log('info', 'a');
         $client->log('info', 'b');
         $client->flush();
 
         $this->assertCount(1, $this->requests(), 'no retry on 503');
-        $this->assertSame(2, $client->stats()['dropped']);
+        $this->assertSame(0, $client->stats()['dropped'], 'kept for a later send');
+        $this->assertSame(1, $client->transport()->spool()->count());
         $this->assertSame(0, $client->transport()->pending());
+    }
+
+    public function test_503_drops_the_batch_without_a_spool(): void
+    {
+        $endpoint = $this->ingestServer(503);
+        $client = new Client(['transport' => 'http', 'endpoint' => $endpoint, 'token' => 't', 'spool' => false]);
+
+        $client->log('info', 'a');
+        $client->log('info', 'b');
+        $client->flush();
+
+        $this->assertCount(1, $this->requests());
+        $this->assertNull($client->transport()->spool());
+        $this->assertSame(2, $client->stats()['dropped']);
     }
 
     public function test_closed_port_never_throws_and_counts_dropped(): void
     {
         $port = self::freePort();
-        $client = new Client(['transport' => 'http', 'endpoint' => "http://127.0.0.1:{$port}", 'token' => 't']);
+        $client = new Client(['transport' => 'http', 'endpoint' => "http://127.0.0.1:{$port}", 'token' => 't', 'spool' => false]);
 
         $client->log('info', 'a');
         $client->log('info', 'b');
@@ -152,7 +193,7 @@ class HttpTransportTest extends TestCase
         // Accepts connections (kernel backlog) but never answers.
         $server = stream_socket_server('tcp://127.0.0.1:0');
         $name = stream_socket_get_name($server, false);
-        $client = new Client(['transport' => 'http', 'endpoint' => "http://{$name}", 'token' => 't']);
+        $client = new Client(['transport' => 'http', 'endpoint' => "http://{$name}", 'token' => 't', 'spool' => false]);
 
         $client->log('info', 'a');
 

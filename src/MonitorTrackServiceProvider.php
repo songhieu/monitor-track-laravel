@@ -140,16 +140,27 @@ class MonitorTrackServiceProvider extends ServiceProvider
                 $this->app->terminating(static fn () => $client->flush(2.0));
             }
 
+            [$timeout, $consoleTimeout] = $this->httpTimeouts();
+
             if ($this->app->runningInConsole() && ! OctaneFlusher::running($this->app)) {
                 // A console process may run for hours without a worker loop
                 // (a daemon command): send when due as events are recorded.
                 // Queue workers send between jobs instead, so a job never
                 // waits for the network.
                 $client->setFlushOnRecord(true);
-                $events->listen(Looping::class, static fn () => $client->setFlushOnRecord(false));
-                $events->listen(JobProcessing::class, static function ($event) use ($client): void {
+                // Nobody waits on an artisan command or the scheduler, so the
+                // ingest gets longer to answer before a batch counts as
+                // failed. Queue workers go back to the short timeout: they
+                // send between jobs.
+                $client->setHttpTimeout($consoleTimeout);
+                $events->listen(Looping::class, static function () use ($client, $timeout): void {
+                    $client->setFlushOnRecord(false);
+                    $client->setHttpTimeout($timeout);
+                });
+                $events->listen(JobProcessing::class, static function ($event) use ($client, $timeout): void {
                     if (! $event->job instanceof SyncJob) {
                         $client->setFlushOnRecord(false);
+                        $client->setHttpTimeout($timeout);
                     }
                 });
             }
@@ -159,7 +170,10 @@ class MonitorTrackServiceProvider extends ServiceProvider
             $events->listen([
                 'Laravel\Horizon\Events\MasterSupervisorLooped',
                 'Laravel\Horizon\Events\SupervisorLooped',
-            ], static fn () => $client->flushIfDue());
+            ], static function () use ($client, $timeout): void {
+                $client->setHttpTimeout($timeout);
+                $client->flushIfDue();
+            });
         } catch (\Throwable) {
         }
 
@@ -183,7 +197,30 @@ class MonitorTrackServiceProvider extends ServiceProvider
         $options['http_connect_timeout_ms'] = $http['connect_timeout_ms'] ?? 500;
         $options['http_timeout_ms'] = $http['timeout_ms'] ?? 1000;
 
+        // A config published before 0.2.3 has no "spool" key: defaults apply.
+        $spool = (array) ($cfg['spool'] ?? []);
+        $options['spool'] = $spool['enabled'] ?? true;
+        $options['spool_path'] = $spool['path'] ?? null;
+        $options['spool_max_mb'] = $spool['max_mb'] ?? 20;
+        $options['spool_max_age_seconds'] = $spool['max_age_seconds'] ?? 3600;
+
         return new Client($options);
+    }
+
+    /**
+     * [web / queue timeout, console timeout] in ms. A config published
+     * before 0.2.3 has no console_timeout_ms: the default applies.
+     *
+     * @return array{0:int, 1:int}
+     */
+    private function httpTimeouts(): array
+    {
+        $o = Client::normalizeOptions([
+            'http_timeout_ms' => $this->config('http.timeout_ms'),
+            'http_console_timeout_ms' => $this->config('http.console_timeout_ms'),
+        ]);
+
+        return [$o['http_timeout_ms'], $o['http_console_timeout_ms']];
     }
 
     private function registerExceptionReporter(Client $client): void
